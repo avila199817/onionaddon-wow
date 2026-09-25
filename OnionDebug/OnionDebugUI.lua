@@ -32,8 +32,7 @@ local HUD_LABEL_WIDTH = 64
 local HUD_ROW_HEIGHT = 14
 local HUD_EVENT_LINES = 6
 local HUD_EVENT_HEIGHT = 13
-local HUD_REFRESH_INTERVAL = 0.3
-local HUD_DIRTY_INTERVAL = 0.1 -- quicker refresh right after an event, still throttled
+local HUD_REFRESH_INTERVAL = 0.25
 
 local FPS_WARN, FPS_BAD = 40, 20
 local LATENCY_WARN, LATENCY_BAD = 200, 400
@@ -142,9 +141,16 @@ local function CreateWindow(spec)
     close:SetSize(24, 24)
     close:SetPoint("TOPRIGHT", -3, -3)
     close:SetScript("OnClick", function() frame:Hide() end)
+    frame.closeButton = close
 
     tinsert(UISpecialFrames, spec.name)
     return frame
+end
+
+-- All windows share one strata; the most recently opened one goes on top.
+local function ShowWindow(frame)
+    frame:Show()
+    frame:Raise()
 end
 
 local function CreateScrollBar(parent)
@@ -344,14 +350,17 @@ local function RefreshHUD()
     values.target:SetText(target.exists and ns.FormatTargetName(target) or ColorValue(ns.COLOR_MUTED, "None"))
     values.npc:SetText(ns.FormatTargetId(target))
 
-    local last = ns.GetEvent(1)
-    values.last:SetText(last and ColorValue(ns.CATEGORY_COLORS[last.category] or "ffffff", last.event)
-        or ColorValue(ns.COLOR_MUTED, "None"))
-    values.incidents:SetText(incidentSummary)
-
-    for index, line in ipairs(hud.eventLines) do
-        local entry = ns.GetEvent(index)
-        line:SetText(entry and ns.FormatEventLine(entry, true, false) or "")
+    -- Event lines are rebuilt only when the ring buffer changed.
+    local version = ns.GetEventVersion()
+    if version ~= hud.eventVersion then
+        hud.eventVersion = version
+        local last = ns.GetEvent(1)
+        values.last:SetText(last and ColorValue(ns.CATEGORY_COLORS[last.category] or "ffffff", last.event)
+            or ColorValue(ns.COLOR_MUTED, "None"))
+        for index, line in ipairs(hud.eventLines) do
+            local entry = ns.GetEvent(index)
+            line:SetText(entry and ns.FormatEventLine(entry, true, false) or "")
+        end
     end
 end
 
@@ -361,7 +370,7 @@ local function UpdateIncidentSummary()
     end
     incidentSummary = format("%d   (%d this session)", #ns.db.incidents, ns.CountSessionIncidents())
     if hud then
-        hud.dirty = true
+        hud.values.incidents:SetText(incidentSummary)
     end
 end
 
@@ -381,7 +390,8 @@ local function ApplyHUDLayout()
     hud:SetHeight(minimized and HUD_MINIMIZED_HEIGHT or HUD_FULL_HEIGHT)
     hud.minimizeButton.label:SetText(minimized and "+" or "-")
     hud:SetShown(settings.hudVisible)
-    hud.dirty = true
+    hud.eventVersion = nil -- force a full refresh on the next tick
+    hud.elapsed = HUD_REFRESH_INTERVAL
 end
 
 local function CreateTitleBarButton(parent, text, onClick)
@@ -472,13 +482,13 @@ local function CreateHUD()
     end)
     copyButton:SetPoint("LEFT", historyButton, "RIGHT", BUTTON_GAP, 0)
 
-    hud.elapsed, hud.dirty = 0, true
+    hud.elapsed = HUD_REFRESH_INTERVAL
     hud:SetScript("OnUpdate", function(self, elapsed)
         self.elapsed = self.elapsed + elapsed
-        if self.elapsed < (self.dirty and HUD_DIRTY_INTERVAL or HUD_REFRESH_INTERVAL) then
+        if self.elapsed < HUD_REFRESH_INTERVAL then
             return
         end
-        self.elapsed, self.dirty = 0, false
+        self.elapsed = 0
         if not ns.db.settings.hudMinimized then
             RefreshHUD()
         end
@@ -511,6 +521,10 @@ local function CycleSeverity()
     UpdateSeverityButton()
 end
 
+-- The draft lives until the user saves or explicitly cancels (CANCEL, X, Esc
+-- in a field). Any other hide - the game closing windows on death, loading
+-- screens, fear, Alt+Z or an ESC while no field has focus - keeps the frozen
+-- snapshot and the typed text; MARK BUG ("DRAFT OPEN") brings the form back.
 local function SubmitForm()
     if ns.Trim(form.titleBox:GetText()) == "" then
         form.titleBox:SetFocus()
@@ -521,7 +535,16 @@ local function SubmitForm()
         ns.Print(err)
         return
     end
-    form.saved = true
+    form.draft = nil
+    form:Hide()
+end
+
+local function CancelForm()
+    if form.draft then
+        form.draft = nil
+        ns.DiscardDraft()
+        ns.Print("Incident discarded.")
+    end
     form:Hide()
 end
 
@@ -545,8 +568,9 @@ local function CreateIncidentForm()
     titleBox:SetMaxLetters(ns.TITLE_MAX_LETTERS)
     titleBox:HookScript("OnTextChanged", UpdateSaveButton)
     titleBox:SetScript("OnEnterPressed", SubmitForm)
-    titleBox:SetScript("OnEscapePressed", function() form:Hide() end)
+    titleBox:SetScript("OnEscapePressed", CancelForm)
     form.titleBox = titleBox
+    form.closeButton:SetScript("OnClick", CancelForm)
 
     form.severityButton = CreateButton(form, "", 170, CycleSeverity)
     form.severityButton:SetPoint("TOPLEFT", PADDING, -CONTENT_TOP - 44)
@@ -559,7 +583,7 @@ local function CreateIncidentForm()
     notes:SetPoint("TOPLEFT", PADDING, -CONTENT_TOP - 92)
     notes:SetPoint("TOPRIGHT", -PADDING, -CONTENT_TOP - 92)
     notes:SetHeight(110)
-    notes.edit:SetScript("OnEscapePressed", function() form:Hide() end)
+    notes.edit:SetScript("OnEscapePressed", CancelForm)
     notes.edit:SetScript("OnTabPressed", function() titleBox:SetFocus() end)
     titleBox:SetScript("OnTabPressed", function() notes.edit:SetFocus() end)
     form.notes = notes
@@ -572,24 +596,24 @@ local function CreateIncidentForm()
     form.contextText:SetJustifyV("TOP")
     form.contextText:SetSpacing(2)
 
-    local hint = CreateText(form, "GameFontDisableSmall")
-    hint:SetPoint("BOTTOMLEFT", PADDING + 2, PADDING + 6)
-    hint:SetText("Enter saves  ·  Tab switches field  ·  Esc cancels")
-
     form.saveButton = CreateButton(form, "SAVE INCIDENT", 120, SubmitForm)
     form.saveButton:SetPoint("BOTTOMRIGHT", -PADDING, PADDING)
-    local cancelButton = CreateButton(form, "CANCEL", 80, function() form:Hide() end)
+    local cancelButton = CreateButton(form, "CANCEL", 80, CancelForm)
     cancelButton:SetPoint("RIGHT", form.saveButton, "LEFT", -BUTTON_GAP, 0)
 
-    -- Hiding without saving (Cancel, X, Esc, ESC menu) discards the draft.
-    form:SetScript("OnHide", function()
+    local hint = CreateText(form, "GameFontDisableSmall")
+    hint:SetPoint("BOTTOMLEFT", PADDING + 2, PADDING + 6)
+    hint:SetWidth(width - 2 * PADDING - 120 - 80 - BUTTON_GAP - 12) -- stops before CANCEL
+    hint:SetWordWrap(false)
+    hint:SetText("Enter: save  ·  Esc: cancel")
+
+    form:SetScript("OnHide", function(self)
         titleBox:ClearFocus()
         notes.edit:ClearFocus()
-        if form.draft and not form.saved then
-            ns.DiscardDraft()
-            ns.Print("Incident discarded.")
+        -- IsShown() stays true when only a parent (UIParent) was hidden.
+        if form.draft and not self:IsShown() then
+            ns.Print("Incident draft kept - click DRAFT OPEN on the HUD or type /od mark to finish it.")
         end
-        form.draft = nil
     end)
 end
 
@@ -597,11 +621,14 @@ function UI.ShowIncidentForm(draft)
     if not form then
         CreateIncidentForm()
     end
-    if form:IsShown() and form.draft == draft then
+    if form.draft == draft then
+        -- same pending draft: bring it back with whatever was typed
+        ShowWindow(form)
+        FitTextArea(form.notes)
         form.titleBox:SetFocus()
         return
     end
-    form.draft, form.saved = draft, false
+    form.draft = draft
     form.severity = ns.DEFAULT_SEVERITY
     form.titleBox:SetText("")
     form.notes.edit:SetText("")
@@ -609,15 +636,17 @@ function UI.ShowIncidentForm(draft)
     UpdateSaveButton()
     form.contextLabel:SetText("Captured context  -  frozen at " .. ns.FormatClock(draft.createdAt))
     form.contextText:SetText(ns.FormatContextSummary(draft, true))
-    form:Show()
+    ShowWindow(form)
     FitTextArea(form.notes)
     form.titleBox:SetFocus()
 end
 
 function UI.BeginIncident()
+    local wasOpen = form ~= nil and form:IsShown()
     local draft, isNew = ns.MarkBug()
     if not isNew then
-        ns.Print("An incident draft is already open - save or cancel it first.")
+        ns.Print(wasOpen and "An incident draft is already open - save or cancel it first."
+            or format("Reopened the pending incident draft (captured %s).", ns.FormatClock(draft.createdAt)))
     end
     UI.ShowIncidentForm(draft)
 end
@@ -803,7 +832,7 @@ function UI.ShowHistory(search)
     if search then
         history.searchBox:SetText(search)
     end
-    history:Show()
+    ShowWindow(history)
     RefreshHistory()
 end
 
@@ -940,7 +969,7 @@ function UI.ShowDetail(id)
         CreateDetail()
     end
     detail.incidentId = id
-    detail:Show()
+    ShowWindow(detail)
     RenderDetail(true)
     if UI.IsHistoryShown() then
         RenderHistoryRows()
@@ -960,7 +989,7 @@ local exportFrame
 local function CreateExport()
     exportFrame = CreateWindow({
         name = "OnionDebugExport", layoutKey = "export", title = "EXPORT",
-        width = 540, height = 460, strata = "FULLSCREEN_DIALOG",
+        width = 540, height = 460,
         defaultPosition = { point = "CENTER", relativePoint = "CENTER", x = 0, y = 20 },
     })
 
@@ -1007,7 +1036,7 @@ function UI.ShowExport(text, title)
     exportFrame.text = text
     local edit = exportFrame.area.edit
     edit:SetText(text)
-    exportFrame:Show()
+    ShowWindow(exportFrame)
     FitTextArea(exportFrame.area)
     exportFrame.area.scroll:SetVerticalScroll(0)
     edit:SetFocus()
@@ -1053,8 +1082,7 @@ function UI.Confirm(message, acceptLabel, onAccept)
     confirm.message:SetText(message)
     confirm.acceptButton:SetText(acceptLabel)
     confirm.onAccept = onAccept
-    confirm:Show()
-    confirm:Raise()
+    ShowWindow(confirm)
 end
 
 function UI.ConfirmDelete(id)
@@ -1065,9 +1093,8 @@ function UI.ConfirmDelete(id)
     end
     UI.Confirm(format("Delete incident %s?\n\"%s\"\n\nThis cannot be undone. The ID is never reused.",
         ns.FormatId(id), ns.Truncate(tostring(incident.title), 60)), "DELETE", function()
-        if ns.DeleteIncident(id) then
-            ns.Print(format("Incident %s deleted.", ns.FormatId(id)))
-        end
+        local deleted, err = ns.DeleteIncident(id)
+        ns.Print(deleted and format("Incident %s deleted.", ns.FormatId(id)) or err)
     end)
 end
 
@@ -1076,11 +1103,7 @@ end
 ------------------------------------------------------------------------
 
 function UI.OnModelChanged(topic)
-    if topic == "events" then
-        if hud then
-            hud.dirty = true
-        end
-    elseif topic == "incidents" then
+    if topic == "incidents" then
         UpdateIncidentSummary()
         if UI.IsHistoryShown() then
             RefreshHistory()

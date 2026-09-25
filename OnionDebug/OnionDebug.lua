@@ -87,6 +87,29 @@ local KNOWN_INCIDENT_FIELDS = {
     metadata = "table",
 }
 
+-- Expected field types inside each snapshot block ("scalar" = string or number).
+-- The detail/export view only reads values of the expected type; anything else
+-- inside a block (legacy data) is listed under "Other fields" as block.key.
+local SECTION_FIELDS = {
+    client = { version = "scalar", build = "scalar", buildDate = "scalar", tocVersion = "scalar", locale = "scalar" },
+    character = { name = "scalar", realm = "scalar", class = "scalar", classToken = "scalar", race = "scalar",
+        level = "number", faction = "scalar" },
+    location = { zone = "scalar", subZone = "scalar", mapID = "scalar", mapName = "scalar", x = "number", y = "number",
+        instanceType = "scalar", instanceName = "scalar", difficulty = "scalar", instanceMapID = "scalar",
+        worldX = "number", worldY = "number" },
+    performance = { fps = "scalar", fpsMin = "scalar", fpsAvg = "scalar", fpsWindow = "scalar", homeLatency = "scalar",
+        worldLatency = "scalar", luaMemoryKB = "number" },
+    player = { combat = "boolean", combatLockdown = "boolean", mounted = "boolean", deadOrGhost = "boolean",
+        swimming = "boolean", resting = "boolean" },
+    target = { exists = "boolean", name = "scalar", level = "number", guid = "scalar", guidType = "scalar",
+        npcId = "scalar", objectId = "scalar", classification = "scalar", isPlayer = "boolean", reaction = "number",
+        creatureType = "scalar", dead = "boolean" },
+    metadata = { addonVersion = "scalar", schemaVersion = "scalar", sessionId = "scalar", sessionUptime = "number",
+        serverTime = "number", addOns = "table", restrictedValues = "number", migratedFromSchema = "scalar",
+        originalId = "scalar" },
+}
+local SECTION_ORDER = { "client", "character", "location", "performance", "player", "target", "metadata" }
+
 local VALID_POINTS = {
     TOP = true, BOTTOM = true, LEFT = true, RIGHT = true, CENTER = true,
     TOPLEFT = true, TOPRIGHT = true, BOTTOMLEFT = true, BOTTOMRIGHT = true,
@@ -180,6 +203,41 @@ local function Truncate(text, maxLength)
     return text:sub(1, cut) .. "..."
 end
 ns.Truncate = Truncate
+
+-- Byte index just past the first `count` letters, counted the way
+-- EditBox:SetMaxLetters counts them (UTF-8 characters; the escaped pipe
+-- "||" typed by the user is one letter). Nil if the text is not longer.
+local function LetterBoundary(text, count)
+    local index, length, letters = 1, #text, 0
+    while index <= length do
+        if letters == count then
+            return index - 1
+        end
+        local byte = text:byte(index)
+        if byte == 124 and text:byte(index + 1) == 124 then
+            index = index + 2
+        elseif byte >= 0xF0 then
+            index = index + 4
+        elseif byte >= 0xE0 then
+            index = index + 3
+        elseif byte >= 0xC0 then
+            index = index + 2
+        else
+            index = index + 1
+        end
+        letters = letters + 1
+    end
+    return nil
+end
+
+-- Letter-based truncation for user-typed text, so a title or note that the
+-- form accepted is never cut on save.
+local function TruncateLetters(text, maxLetters)
+    if not LetterBoundary(text, maxLetters) then
+        return text
+    end
+    return text:sub(1, LetterBoundary(text, maxLetters - 3)) .. "..."
+end
 
 -- Game-provided text (chat, errors) may carry color codes, links and icons.
 -- Store it as plain single-line text so HUD, detail and export stay clean.
@@ -279,10 +337,13 @@ function ns.FormatBuild(client)
     if type(client) ~= "table" then
         return nil
     end
-    if client.version and client.build then
-        return client.version .. "." .. client.build
+    local version, build = client.version, client.build
+    version = (type(version) == "string" or type(version) == "number") and tostring(version) or nil
+    build = (type(build) == "string" or type(build) == "number") and tostring(build) or nil
+    if version and build then
+        return version .. "." .. build
     end
-    return client.version
+    return version
 end
 
 ns.CURRENT_BUILD = ns.FormatBuild(ns.client)
@@ -324,7 +385,9 @@ local function CollectCharacter()
     }
 end
 
-local function CollectLocation(out)
+-- `detailed` adds map name, instance and world position (snapshots only;
+-- the HUD refresh skips them to keep its tick cheap).
+local function CollectLocation(out, detailed)
     out.zone = NonEmpty(GetRealZoneText and GetRealZoneText())
     out.subZone = NonEmpty(GetSubZoneText and GetSubZoneText())
 
@@ -333,7 +396,7 @@ local function CollectLocation(out)
         mapID = Readable(C_Map.GetBestMapForUnit("player"))
     end
     if mapID then
-        if C_Map.GetMapInfo then
+        if detailed and C_Map.GetMapInfo then
             local info = C_Map.GetMapInfo(mapID)
             mapName = type(info) == "table" and NonEmpty(info.name) or nil
         end
@@ -350,6 +413,9 @@ local function CollectLocation(out)
         end
     end
     out.mapID, out.mapName, out.x, out.y = mapID, mapName, x, y
+    if not detailed then
+        return out
+    end
 
     local instanceType, instanceName, difficulty, instanceMapID
     if GetInstanceInfo then
@@ -445,7 +511,7 @@ end
 
 -- Fills a reusable { location, performance, player, target } table for the HUD.
 function ns.CollectLive(state)
-    CollectLocation(state.location)
+    CollectLocation(state.location, false)
     CollectPerformance(state.performance)
     CollectPlayerState(state.player)
     CollectTarget(state.target)
@@ -496,7 +562,9 @@ end
 -- steady stream of events does not allocate.
 ------------------------------------------------------------------------
 
-local ring = { entries = {}, head = 0, size = 0, capacity = 200, recorded = 0 }
+-- `version` changes on every push, coalesce, clear or resize, so readers
+-- (the HUD) can skip re-rendering when nothing happened.
+local ring = { entries = {}, head = 0, size = 0, capacity = 200, recorded = 0, version = 0 }
 
 -- index 1 = newest
 function ns.GetEvent(index)
@@ -510,6 +578,10 @@ function ns.GetEventStats()
     return ring.size, ring.capacity, ring.recorded
 end
 
+function ns.GetEventVersion()
+    return ring.version
+end
+
 local function ResizeEventBuffer(capacity)
     local keep = min(ring.size, capacity)
     local entries = {}
@@ -517,6 +589,7 @@ local function ResizeEventBuffer(capacity)
         entries[keep - index + 1] = ns.GetEvent(index)
     end
     ring.entries, ring.capacity, ring.size, ring.head = entries, capacity, keep, keep
+    ring.version = ring.version + 1
 end
 
 local function PushEvent(event, category, info)
@@ -525,6 +598,7 @@ local function PushEvent(event, category, info)
     if newest and newest.event == event and newest.info == info and now - newest.uptime <= EVENT_COALESCE_SECONDS then
         newest.count = newest.count + 1
         newest.time, newest.uptime = time(), now
+        ring.version = ring.version + 1
         return newest, false
     end
     local slot = ring.head % ring.capacity + 1
@@ -539,6 +613,7 @@ local function PushEvent(event, category, info)
         ring.size = ring.size + 1
     end
     ring.recorded = ring.recorded + 1
+    ring.version = ring.version + 1
     return entry, true
 end
 
@@ -553,6 +628,7 @@ end
 function ns.ClearEvents()
     wipe(ring.entries)
     ring.head, ring.size = 0, 0
+    ring.version = ring.version + 1
     NotifyUI("events")
 end
 
@@ -832,7 +908,7 @@ function ns.CaptureSnapshot()
         createdAtText = date(DATE_FORMAT, now),
         client = CopyTable(ns.client),
         character = CollectCharacter(),
-        location = CollectLocation({}),
+        location = CollectLocation({}, true),
         performance = performance,
         player = CollectPlayerState({}),
         target = CollectTarget({}),
@@ -894,6 +970,9 @@ function ns.DiscardDraft()
 end
 
 function ns.SaveIncident(snapshot, title, notes, severity)
+    if ns.readOnlyReason then
+        return nil, ns.readOnlyReason
+    end
     if type(snapshot) ~= "table" then
         return nil, "There is no captured context to save."
     end
@@ -909,8 +988,8 @@ function ns.SaveIncident(snapshot, title, notes, severity)
     local db = ns.db
     snapshot.id = db.nextIncidentId
     db.nextIncidentId = snapshot.id + 1
-    snapshot.title = Truncate(title, ns.TITLE_MAX_LETTERS)
-    snapshot.notes = notes ~= "" and Truncate(notes, ns.NOTES_MAX_LETTERS) or nil
+    snapshot.title = TruncateLetters(title, ns.TITLE_MAX_LETTERS)
+    snapshot.notes = notes ~= "" and TruncateLetters(notes, ns.NOTES_MAX_LETTERS) or nil
     snapshot.severity = SEVERITY_SET[severity] and severity or ns.DEFAULT_SEVERITY
     db.incidents[#db.incidents + 1] = snapshot
 
@@ -928,10 +1007,14 @@ function ns.QuickMark(title)
     return ns.SaveIncident(ns.CaptureSnapshot(), title, nil, ns.DEFAULT_SEVERITY)
 end
 
+-- Returns true, or false plus a reason.
 function ns.DeleteIncident(id)
+    if ns.readOnlyReason then
+        return false, ns.readOnlyReason
+    end
     local incident, index = ns.FindIncident(id)
     if not incident then
-        return false
+        return false, format("Incident %s not found.", ns.FormatId(id))
     end
     remove(ns.db.incidents, index)
     NotifyUI("incidents")
@@ -1129,6 +1212,29 @@ function ns.FormatContextSummary(snapshot, useColor)
     return concat(lines, "\n")
 end
 
+local function MatchesType(expected, value)
+    local actual = type(value)
+    if expected == "scalar" then
+        return actual == "string" or actual == "number"
+    end
+    return actual == expected
+end
+
+-- Copy of one snapshot block holding only fields of the expected type.
+local function TypedSection(incident, section)
+    local source = incident[section]
+    if type(source) ~= "table" then
+        return EMPTY
+    end
+    local spec, view = SECTION_FIELDS[section], {}
+    for key, expected in pairs(spec) do
+        if MatchesType(expected, source[key]) then
+            view[key] = source[key]
+        end
+    end
+    return view
+end
+
 local function FlattenValue(rows, label, value, depth)
     if type(value) ~= "table" then
         rows[#rows + 1] = { label, Display(value) }
@@ -1166,20 +1272,20 @@ function ns.DescribeIncident(incident, useColor)
         rows[#rows + 1] = { label, Display(value) }
     end
 
-    local client, character = Sub(incident, "client"), Sub(incident, "character")
-    local location, player = Sub(incident, "location"), Sub(incident, "player")
-    local target, performance = Sub(incident, "target"), Sub(incident, "performance")
-    local metadata = Sub(incident, "metadata")
+    local client, character = TypedSection(incident, "client"), TypedSection(incident, "character")
+    local location, player = TypedSection(incident, "location"), TypedSection(incident, "player")
+    local target, performance = TypedSection(incident, "target"), TypedSection(incident, "performance")
+    local metadata = TypedSection(incident, "metadata")
 
     if incident.id then
         Section("Title")[1] = Display(incident.title)
         local summary = Section(nil)
-        summary[1] = { "Severity", ns.FormatSeverity(incident.severity, useColor) }
-        Row(summary, "Created", incident.createdAtText or ns.FormatDateTime(incident.createdAt))
+        summary[1] = { "Severity", ns.FormatSeverity(type(incident.severity) == "string" and incident.severity or nil, useColor) }
+        Row(summary, "Created", type(incident.createdAtText) == "string" and incident.createdAtText or ns.FormatDateTime(incident.createdAt))
         local notes = Section("Notes")
         notes[1] = (type(incident.notes) == "string" and incident.notes ~= "") and incident.notes or "(none)"
     else
-        Row(Section(nil), "Captured", incident.createdAtText)
+        Row(Section(nil), "Captured", type(incident.createdAtText) == "string" and incident.createdAtText or nil)
     end
 
     local rows = Section("Client")
@@ -1221,7 +1327,8 @@ function ns.DescribeIncident(incident, useColor)
     Row(rows, "Resting", player.resting)
 
     rows = Section("Target")
-    if target.exists then
+    -- legacy incidents may lack `exists` but still carry target data
+    if target.exists or (target.exists == nil and (target.name or target.guid)) then
         Row(rows, "Name", target.name)
         Row(rows, "Level", ns.FormatLevel(target.level))
         Row(rows, "Classification", target.classification)
@@ -1253,7 +1360,10 @@ function ns.DescribeIncident(incident, useColor)
     Row(rows, "Session uptime", metadata.sessionUptime and ns.FormatDuration(metadata.sessionUptime) or nil)
     Row(rows, "Server time", ns.FormatDateTime(metadata.serverTime))
     Row(rows, "OnionDebug", metadata.addonVersion and format("%s (schema %s)", metadata.addonVersion, Display(metadata.schemaVersion)) or nil)
-    local addOns = Sub(metadata, "addOns")
+    local addOns = {}
+    for index, name in ipairs(Sub(metadata, "addOns")) do
+        addOns[index] = tostring(name)
+    end
     Row(rows, "AddOns", format("%d loaded%s", #addOns, #addOns > 0 and (": " .. concat(addOns, ", ")) or ""))
     if metadata.restrictedValues then
         Row(rows, "Restricted values", format("%d value(s) were secret at capture time", metadata.restrictedValues))
@@ -1261,8 +1371,9 @@ function ns.DescribeIncident(incident, useColor)
     if metadata.migratedFromSchema then
         Row(rows, "Migrated from schema", metadata.migratedFromSchema)
     end
-    if metadata.originalId then
-        Row(rows, "Original ID", ns.FormatId(metadata.originalId) .. " (renumbered: duplicate ID)")
+    if metadata.originalId ~= nil then
+        local original = type(metadata.originalId) == "number" and ns.FormatId(metadata.originalId) or tostring(metadata.originalId)
+        Row(rows, "Original ID", original .. " (renumbered: duplicate or invalid ID)")
     end
 
     rows = Section("Last event")
@@ -1272,25 +1383,44 @@ function ns.DescribeIncident(incident, useColor)
     local recentEvents = Sub(incident, "recentEvents")
     rows = Section(format("Recent events (%d, newest first)", #recentEvents))
     for _, entry in ipairs(recentEvents) do
-        if type(entry) == "table" then
-            rows[#rows + 1] = ns.FormatEventLine(entry, useColor, true)
-        end
+        rows[#rows + 1] = type(entry) == "table" and ns.FormatEventLine(entry, useColor, true) or Display(entry)
     end
     if #rows == 0 then
         rows[1] = "(none)"
     end
 
+    -- Nothing stored is hidden: unknown or wrongly typed fields, top-level or
+    -- inside a known block, are listed here (and exported).
+    local other = {}
     local otherKeys = {}
     for key, value in pairs(incident) do
         if KNOWN_INCIDENT_FIELDS[key] ~= type(value) then
             otherKeys[#otherKeys + 1] = key
         end
     end
-    if #otherKeys > 0 then
-        sort(otherKeys, function(a, b) return tostring(a) < tostring(b) end)
+    sort(otherKeys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, key in ipairs(otherKeys) do
+        FlattenValue(other, tostring(key), incident[key], 1)
+    end
+    for _, section in ipairs(SECTION_ORDER) do
+        local block = incident[section]
+        if type(block) == "table" then
+            local spec, keys = SECTION_FIELDS[section], {}
+            for key, value in pairs(block) do
+                if not (spec[key] and MatchesType(spec[key], value)) then
+                    keys[#keys + 1] = key
+                end
+            end
+            sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+            for _, key in ipairs(keys) do
+                FlattenValue(other, section .. "." .. tostring(key), block[key], 2)
+            end
+        end
+    end
+    if #other > 0 then
         rows = Section("Other fields")
-        for _, key in ipairs(otherKeys) do
-            FlattenValue(rows, tostring(key), incident[key], 1)
+        for index, row in ipairs(other) do
+            rows[index] = row
         end
     end
 
@@ -1473,15 +1603,35 @@ local function IncidentOrder(a, b)
     return tostring(a.title) < tostring(b.title)
 end
 
+-- Keeps a replaced legacy id visible: metadata.originalId, or a top-level
+-- legacyId (listed under "Other fields") when metadata is not a table.
+local function RememberOriginalId(incident, rawId)
+    if rawId == nil then
+        return
+    end
+    if incident.metadata == nil then
+        incident.metadata = {}
+    end
+    if type(incident.metadata) == "table" then
+        if incident.metadata.originalId == nil then
+            incident.metadata.originalId = rawId
+        end
+    elseif incident.legacyId == nil then
+        incident.legacyId = rawId
+    end
+end
+
 -- Rebuilds db.incidents as a clean ascending array with unique ids.
--- Never drops data: non-table entries are moved to db.quarantine and
--- duplicate ids get a fresh id (original kept in metadata.originalId).
+-- Never drops data: non-table entries are moved to db.quarantine, and
+-- incidents with a missing, invalid or duplicate id get a fresh id (in
+-- chronological order) while the old value is kept via RememberOriginalId.
 -- Returns the number of entries quarantined.
 local function NormalizeIncidentList(db)
     local list, quarantined = {}, 0
     if type(db.incidents) == "table" then
         for key, incident in pairs(db.incidents) do
             if type(incident) == "table" then
+                NormalizeIncident(incident) -- derives createdAt before sorting
                 list[#list + 1] = incident
             else
                 db.quarantine = type(db.quarantine) == "table" and db.quarantine or {}
@@ -1499,26 +1649,29 @@ local function NormalizeIncidentList(db)
 
     local seen, maxId, pending = {}, 0, {}
     for _, incident in ipairs(list) do
-        NormalizeIncident(incident)
-        local id = PositiveInteger(incident.id)
+        local rawId = incident.id
+        local id = PositiveInteger(rawId)
         if id and seen[id] then
-            if incident.metadata == nil then
-                incident.metadata = {}
-            end
-            if type(incident.metadata) == "table" then
-                incident.metadata.originalId = id
-            end
-            id = nil
+            id = nil -- duplicate: the older incident (sorted first) keeps it
         end
         if id then
             seen[id] = true
             incident.id = id
             maxId = max(maxId, id)
         else
+            RememberOriginalId(incident, rawId)
             pending[#pending + 1] = incident
         end
     end
 
+    -- new ids follow creation time, so "last" and newest-first stay chronological
+    sort(pending, function(a, b)
+        local timeA, timeB = tonumber(a.createdAt) or 0, tonumber(b.createdAt) or 0
+        if timeA ~= timeB then
+            return timeA < timeB
+        end
+        return tostring(a.title) < tostring(b.title)
+    end)
     local nextId = max(PositiveInteger(db.nextIncidentId) or 1, maxId + 1)
     for _, incident in ipairs(pending) do
         incident.id = nextId
@@ -1568,14 +1721,9 @@ local MIGRATIONS = {
 }
 
 -- Returns the schema version the data was migrated from, or nil.
+-- Newer schemas never reach this function (see InitializeDatabase).
 local function MigrateDatabase(db)
     local version = PositiveInteger(db.schemaVersion) or 1
-    if version > SCHEMA_VERSION then
-        ns.startupWarnings[#ns.startupWarnings + 1] = format(
-            "Saved data uses schema %d but this OnionDebug knows schema %d. Nothing was changed; update the addon.",
-            version, SCHEMA_VERSION)
-        return nil
-    end
     local from = version
     while version < SCHEMA_VERSION do
         MIGRATIONS[version](db)
@@ -1607,6 +1755,16 @@ local function InitializeDatabase()
             ns.startupWarnings[#ns.startupWarnings + 1] = "Saved data was not a table; it was kept in OnionDebugDB.quarantine."
         end
     end
+    local storedVersion = PositiveInteger(OnionDebugDB.schemaVersion)
+    if storedVersion and storedVersion > SCHEMA_VERSION then
+        -- Written by a newer OnionDebug: leave it byte-for-byte untouched and run
+        -- this session on an in-memory database that is never saved.
+        ns.readOnlyReason = format("Saved data belongs to a newer OnionDebug (schema %d, this version knows %d). "
+            .. "Your data is untouched but nothing is saved this session - update the addon.", storedVersion, SCHEMA_VERSION)
+        ns.db = { schemaVersion = SCHEMA_VERSION }
+        ValidateDatabase(ns.db)
+        return
+    end
     local db = OnionDebugDB
     ns.db = db
     ns.migratedFrom = MigrateDatabase(db)
@@ -1619,7 +1777,9 @@ end
 
 local function AnnounceDatabase()
     local count = #ns.db.incidents
-    if not ns.dbLoadedFromDisk then
+    if ns.readOnlyReason then
+        ns.Print(Colorize(ns.COLOR_WARNING, ns.readOnlyReason))
+    elseif not ns.dbLoadedFromDisk then
         ns.Print(format("v%s loaded - new database created. Type /od help for commands.", ns.VERSION))
         ns.Print(Colorize(ns.COLOR_WARNING, "If you already had incidents, the client did not load SavedVariables: back up "
             .. "WTF\\Account\\<account>\\SavedVariables\\OnionDebug.lua (and .bak) before logging out, "
@@ -1689,7 +1849,8 @@ local function PrintStatus()
             #unavailable > 0 and (" (unavailable: " .. concat(unavailable, ", ") .. ")") or ""))
     end
     ns.Print(format("Lua error capture: %s", ns.GetLuaCaptureState()))
-    ns.Print(format("SavedVariables: %s", ns.dbLoadedFromDisk and "loaded from disk" or "new database this session"))
+    ns.Print(format("SavedVariables: %s", ns.readOnlyReason and "newer schema on disk - read-only session, nothing is saved"
+        or ns.dbLoadedFromDisk and "loaded from disk" or "new database this session"))
     if type(db.quarantine) == "table" and #db.quarantine > 0 then
         ns.Print(Colorize(ns.COLOR_WARNING, format("Quarantined entries: %d (OnionDebugDB.quarantine)", #db.quarantine)))
     end

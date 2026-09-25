@@ -25,6 +25,31 @@ local function Check(condition, message)
     end
 end
 
+-- Deterministic dump used to prove saved data was not modified.
+local function Serialize(value)
+    if type(value) ~= "table" then
+        return type(value) .. ":" .. tostring(value)
+    end
+    local keys = {}
+    for key in pairs(value) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys, function(a, b) return Serialize(a) < Serialize(b) end)
+    local parts = {}
+    for _, key in ipairs(keys) do
+        parts[#parts + 1] = Serialize(key) .. "=" .. Serialize(value[key])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function FindHUD()
+    for _, frame in ipairs(Mock.state.frames) do
+        if frame.layoutKey == "hud" then
+            return frame
+        end
+    end
+end
+
 local function Contains(haystack, needle)
     return type(haystack) == "string" and haystack:find(needle, 1, true) ~= nil
 end
@@ -109,8 +134,12 @@ Scenario("cancel does not create an incident or consume an ID", function()
     Check(#_G.OnionDebugDB.incidents == 0 and _G.OnionDebugDB.nextIncidentId == 1, "no incident, ID not consumed")
 
     ns.UI.BeginIncident()
-    form:Hide() -- X button / ESC menu
-    Check(ns.draft == nil, "hiding the form discards the draft")
+    form.closeButton:Click() -- X button
+    Check(ns.draft == nil and not form:IsShown(), "X button cancels and discards")
+
+    ns.UI.BeginIncident()
+    Mock.RunScript(form.notes.edit, "OnEscapePressed") -- Esc in the notes box
+    Check(ns.draft == nil and not form:IsShown(), "Esc in notes cancels")
 
     ns.UI.BeginIncident()
     local first = ns.draft
@@ -209,10 +238,176 @@ Scenario("legacy schema 1 database migrates without data loss", function()
 end)
 
 Scenario("database from a newer schema is left untouched", function()
-    Mock.Boot(ROOT, { db = { schemaVersion = 99, incidents = {}, nextIncidentId = 5, futureField = true } })
-    local db = _G.OnionDebugDB
-    Check(db.schemaVersion == 99 and db.futureField == true, "schema and unknown fields kept")
-    Check(Contains(Mock.ChatSince(0), "update the addon"), "warning shown")
+    local future = {
+        schemaVersion = 99, nextIncidentId = 5, futureField = true, settings = { maxEvents = 5000, hudVisible = "auto" },
+        incidents = { ["S1-0010"] = { title = "" }, "packed|string" }, session = { id = 7 },
+    }
+    local before = Serialize(future)
+    local ns = Mock.Boot(ROOT, { db = future })
+    Check(Contains(Mock.ChatSince(0), "newer OnionDebug") and Contains(Mock.ChatSince(0), "update the addon"), "warning shown")
+    local incident, err = ns.QuickMark("should not persist")
+    Check(incident == nil and Contains(err, "nothing is saved"), "saving refused with a clear reason")
+    Mock.Slash("set maxEvents 300")
+    Mock.Slash("hide")
+    Mock.Tick(0.3, 2)
+    Check(Serialize(_G.OnionDebugDB) == before, "saved data byte-for-byte unchanged")
+    local chat = #Mock.state.chat
+    Mock.Slash("status")
+    Check(Contains(Mock.ChatSince(chat), "read-only session"), "status reports read-only mode")
+end)
+
+Scenario("draft survives windows closed by the game", function()
+    local ns = Mock.Boot(ROOT)
+    Mock.state.target = NPC_TARGET
+    ns.UI.BeginIncident()
+    local draft = ns.draft
+    local form = _G.OnionDebugIncidentForm
+    form.titleBox:SetText("Died while typing")
+    form.notes.edit:SetText("half written")
+    form.severityButton:Click()
+    Check(FindHUD().markButton:GetText():find("DRAFT OPEN", 1, true) ~= nil, "HUD shows the pending draft")
+
+    -- Blizzard's CloseSpecialWindows: death, loading screen, fear, ESC with no focus
+    local chat = #Mock.state.chat
+    for _, name in ipairs(_G.UISpecialFrames) do
+        local frame = _G[name]
+        if frame and frame:IsShown() then
+            frame:Hide()
+        end
+    end
+    Check(not form:IsShown() and ns.draft == draft, "draft kept when the game closes windows")
+    Check(Contains(Mock.ChatSince(chat), "draft kept"), "user told how to resume")
+    Check(Mock.state.focus == nil, "keyboard released")
+
+    Mock.state.target, Mock.state.zone = nil, "Elwynn Forest"
+    Mock.Advance(30)
+    ns.UI.BeginIncident() -- DRAFT OPEN
+    Check(form:IsShown() and ns.draft == draft, "MARK BUG reopens the same draft")
+    Check(form.titleBox:GetText() == "Died while typing" and form.notes.edit:GetText() == "half written",
+        "typed text kept")
+    form.saveButton:Click()
+    local incident = ns.FindIncident(1)
+    Check(incident and incident.target.npcId == 1423 and incident.location.zone == "Stormwind City",
+        "saved with the original snapshot")
+    Check(incident.severity == "High", "severity choice kept")
+    Check(ns.draft == nil and FindHUD().markButton:GetText():find("MARK BUG", 1, true) ~= nil, "draft cleared after save")
+end)
+
+Scenario("letter limits match the EditBox (UTF-8, escaped pipes)", function()
+    local ns = Mock.Boot(ROOT)
+    local title = string.rep("\195\177", 120) -- 120 x "n with tilde", 240 bytes
+    local notes = string.rep("\195\169", 4000)
+    local incident = ns.SaveIncident(ns.CaptureSnapshot(), title, notes)
+    Check(incident.title == title, "120 accented letters kept whole")
+    Check(incident.notes == notes, "4000 accented letters kept whole")
+    local piped = ns.SaveIncident(ns.CaptureSnapshot(), string.rep("||", 120))
+    Check(piped.title == string.rep("||", 120), "escaped pipes count as one letter")
+    local long = ns.QuickMark(string.rep("\208\182", 130)) -- Cyrillic
+    Check(long.title == string.rep("\208\182", 117) .. "...", "over-long slash title cut on a letter boundary")
+end)
+
+Scenario("legacy nested fields are shown and never break formatting", function()
+    local legacy = {
+        nextIncidentId = 2,
+        incidents = {
+            {
+                id = 1, title = "Nested", createdAtText = 12,
+                target = { exists = true, name = "Guard", npcID = 1423, level = "55" },
+                location = { zone = "Elwynn", coords = "32.1, 45.6", mapID = { uiMapID = 1429 } },
+                performance = { fps = 60, latency = "27/31" },
+                client = { version = 1.12, build = 5875 },
+                metadata = { addOns = { "A", 5, true } },
+                recentEvents = { "09:41 ZONE_CHANGED", { event = "X", info = { 1 } } },
+            },
+        },
+    }
+    local ns = Mock.Boot(ROOT, { db = legacy })
+    local incident = ns.FindIncident(1)
+    local ok, text = pcall(ns.FormatIncidentText, incident)
+    Check(ok, "export does not crash: " .. tostring(not ok and text or ""))
+    text = ok and text or ""
+    Check(Contains(text, "target.npcID: 1423") and Contains(text, "target.level: 55"), "unknown/mistyped target fields exported")
+    Check(Contains(text, "location.coords: 32.1, 45.6") and Contains(text, "location.mapID.uiMapID: 1429"), "nested location fields exported")
+    Check(Contains(text, "performance.latency: 27/31") and Contains(text, "createdAtText: 12"), "other mistyped fields exported")
+    Check(Contains(text, "Name: Guard") and Contains(text, "Zone: Elwynn") and Contains(text, "Version: 1.12"), "valid fields still rendered")
+    Check(Contains(text, "09:41 ZONE_CHANGED") and Contains(text, "3 loaded: A, 5, true"), "legacy events and addon list rendered")
+    Check(pcall(ns.FormatIncidentsText, { incident }), "export all works")
+    Check(pcall(ns.FormatIncidentMeta, incident, true) and pcall(ns.IncidentMatches, incident, "x"), "history row and search work")
+    ns.UI.ShowHistory()
+    ns.UI.ShowDetail(1)
+    Check(_G.OnionDebugDetail:IsShown(), "detail renders")
+end)
+
+Scenario("legacy ids renumbered chronologically, originals kept", function()
+    local legacy = {
+        incidents = {
+            { id = 2, title = "Zone text wrong", time = 1780000000 },
+            { id = 2, title = "Anchor broken", time = 1780009000 },
+            { title = "Weapon glow", time = 1780001000 },
+            { title = "Bag slot", time = 1780008000 },
+            { id = "#0004", title = "Four", time = 1780002000 },
+            { id = 0, title = "Zero", time = 1780003000 },
+            { id = 2, title = "Dup meta", time = 1780004000, metadata = "v1" },
+        },
+    }
+    local ns = Mock.Boot(ROOT, { db = legacy })
+    local byTitle = {}
+    for _, incident in ipairs(_G.OnionDebugDB.incidents) do
+        byTitle[incident.title] = incident
+    end
+    Check(byTitle["Zone text wrong"].id == 2, "oldest duplicate keeps the shared id")
+    local order = { "Weapon glow", "Four", "Zero", "Dup meta", "Bag slot", "Anchor broken" }
+    local chronological = true
+    for index = 2, #order do
+        if byTitle[order[index]].id <= byTitle[order[index - 1]].id then
+            chronological = false
+        end
+    end
+    Check(chronological, "renumbered incidents follow creation time")
+    Check(ns.GetLatestIncident().title == "Anchor broken", "'last' is the newest incident")
+    Check(byTitle["Anchor broken"].metadata.originalId == 2, "duplicate keeps original id")
+    Check(byTitle["Four"].metadata.originalId == "#0004" and byTitle["Zero"].metadata.originalId == 0, "invalid ids kept")
+    Check(byTitle["Dup meta"].legacyId == 2 and byTitle["Dup meta"].metadata == "v1", "non-table metadata untouched, id kept as legacyId")
+    Check(Contains(ns.FormatIncidentText(byTitle["Four"]), "Original ID: #0004"), "original id exported")
+    Check(Contains(ns.FormatIncidentText(byTitle["Dup meta"]), "legacyId: 2"), "legacyId exported")
+    Mock.Reload(ROOT)
+    local ids = {}
+    for index, incident in ipairs(_G.OnionDebugDB.incidents) do
+        ids[index] = incident.id
+    end
+    Mock.Reload(ROOT)
+    local stable = true
+    for index, incident in ipairs(_G.OnionDebugDB.incidents) do
+        stable = stable and ids[index] == incident.id
+    end
+    Check(stable, "normalization is stable across reloads")
+end)
+
+Scenario("windows stack in opening order; HUD throttle respected", function()
+    local ns = Mock.Boot(ROOT)
+    ns.UI.ShowExport(ns.FormatIncidentText(ns.CaptureSnapshot()), "Current context") -- HUD COPY
+    Mock.Slash("history")
+    ns.UI.BeginIncident()
+    Check(_G.OnionDebugIncidentForm.strata == _G.OnionDebugExport.strata
+        and _G.OnionDebugHistory.strata == _G.OnionDebugExport.strata, "form, history and export share a strata")
+    Check(Mock.state.focus == _G.OnionDebugIncidentForm.titleBox, "focus on the visible form")
+    Check(_G.OnionDebugConfirm == nil or _G.OnionDebugConfirm.strata == "FULLSCREEN_DIALOG", "confirm stays on top")
+
+    local mapCalls, infoCalls = 0, 0
+    local getBest, getInfo = C_Map.GetBestMapForUnit, C_Map.GetMapInfo
+    C_Map.GetBestMapForUnit = function(...) mapCalls = mapCalls + 1 return getBest(...) end
+    C_Map.GetMapInfo = function(...) infoCalls = infoCalls + 1 return getInfo(...) end
+    for _ = 1, 60 do -- one second at 60 fps with an event every frame
+        Mock.FireEvent("QUEST_LOG_UPDATE")
+        Mock.Tick(1 / 60)
+    end
+    Check(mapCalls <= 5, "HUD refreshes at most every 0.25 s under event spam (" .. mapCalls .. " in 1 s)")
+    Check(infoCalls == 0, "HUD tick skips map-info allocation")
+    Mock.Tick(0.3) -- next throttled refresh
+    local hud = FindHUD()
+    local lines = hud.eventLines[1]:GetText()
+    Check(Contains(lines, "QUEST_LOG_UPDATE") and Contains(lines, "(x60)"), "coalesced event rendered")
+    C_Map.GetBestMapForUnit, C_Map.GetMapInfo = getBest, getInfo
 end)
 
 Scenario("non-table saved data is quarantined", function()

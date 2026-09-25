@@ -62,9 +62,17 @@ High-frequency events such as `UNIT_AURA` and the combat log are never tracked.
 
 Tip: create a macro containing `/od mark` and put it on an action bar or key. It works in combat.
 
+A draft is only discarded by **CANCEL**, the **X** button or **Esc** inside a field. If the game closes windows while you type (death, a loading screen, fear, Alt+Z, ESC with no field focused), the frozen snapshot and your text are kept. The HUD button then reads **DRAFT OPEN**; click it (or run `/od mark`) to finish the incident. Drafts are not kept across `/reload`.
+
 ### Data
 
-Everything is stored locally in `WTF/Account/<account>/SavedVariables/OnionDebug.lua` (`OnionDebugDB`, schema 2). Databases from the first version (`incidents`, `nextIncidentId`, `position`) are migrated automatically. Fields the addon does not recognise are kept and shown under "Other fields", and invalid entries are moved to `OnionDebugDB.quarantine` instead of being deleted.
+Everything is stored locally in `WTF/Account/<account>/SavedVariables/OnionDebug.lua` (`OnionDebugDB`, schema 2). Databases from the first version (`incidents`, `nextIncidentId`, `position`) are migrated automatically:
+
+- Fields the addon does not recognise, including nested ones, are kept and shown under "Other fields".
+- Invalid entries are moved to `OnionDebugDB.quarantine` instead of being deleted.
+- Incidents with a missing, invalid or duplicate ID are renumbered in creation-time order, and the old value is kept as "Original ID".
+
+Data written by a *newer* OnionDebug is never modified. That session runs read-only: nothing is saved and `/od status` says so.
 
 Early Forever Beta builds (69913) had a client bug where SavedVariables were written but never loaded back. If OnionDebug reports *new database created* while you already had incidents, back up `OnionDebug.lua` and `OnionDebug.lua.bak` before logging out. `/od export all` also works as a text backup.
 
