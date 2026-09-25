@@ -368,7 +368,8 @@ local function UpdateIncidentSummary()
     if not ns.db then
         return
     end
-    incidentSummary = format("%d   (%d this session)", #ns.db.incidents, ns.CountSessionIncidents())
+    incidentSummary = format("%d   (%d session, %d unreported)", #ns.db.incidents,
+        ns.CountSessionIncidents(), ns.CountUnreported())
     if hud then
         hud.values.incidents:SetText(incidentSummary)
     end
@@ -667,6 +668,7 @@ local function RenderHistoryRows()
             row.incidentId = incident.id
             row.idText:SetText(ns.Colorize(ns.SEVERITY_COLORS[incident.severity] or "ffffff", ns.FormatId(incident.id)))
             row.titleText:SetText(tostring(incident.title))
+            row.statusText:SetText(ns.ReportTag(incident, true))
             row.metaText:SetText(ns.FormatIncidentMeta(incident, true))
             row.selected:SetShown(incident.id == selectedId)
             row:Show()
@@ -733,9 +735,12 @@ local function CreateHistoryRow(parent, width)
     row.idText = CreateText(row, "GameFontNormal")
     row.idText:SetPoint("TOPLEFT", 6, -3)
     row.idText:SetWidth(52)
+    row.statusText = CreateText(row, "GameFontNormalSmall", "RIGHT")
+    row.statusText:SetPoint("TOPRIGHT", -6, -5)
+    row.statusText:SetWidth(70)
     row.titleText = CreateText(row, "GameFontHighlight")
     row.titleText:SetPoint("TOPLEFT", 62, -3)
-    row.titleText:SetPoint("TOPRIGHT", -6, -3)
+    row.titleText:SetPoint("TOPRIGHT", -80, -3)
     row.titleText:SetWordWrap(false)
     row.metaText = CreateText(row, "GameFontDisableSmall")
     row.metaText:SetPoint("TOPLEFT", 62, -19)
@@ -881,6 +886,8 @@ local function RenderDetail(resetScroll)
         return
     end
     detail.titleText:SetText("INCIDENT " .. ns.FormatId(incident.id))
+    detail.markButton:SetText(ns.IsReported(incident) and "MARK NOT REPORTED" or "MARK AS REPORTED")
+    detail.markButton:SetEnabled(not ns.readOnlyReason)
     local width = detail.area.scroll:GetWidth()
     if not width or width <= 0 then
         return -- laid out later through onResize
@@ -927,7 +934,7 @@ local function CreateDetail()
 
     detail.area = CreateScrollArea(detail, false)
     detail.area:SetPoint("TOPLEFT", PADDING + 2, -CONTENT_TOP)
-    detail.area:SetPoint("BOTTOMRIGHT", -PADDING, PADDING + BUTTON_HEIGHT + 8)
+    detail.area:SetPoint("BOTTOMRIGHT", -PADDING, PADDING + 2 * BUTTON_HEIGHT + BUTTON_GAP + 8)
     detail.content = CreateFrame("Frame", nil, detail.area.scroll)
     detail.content:SetSize(1, 1)
     detail.area.scroll:SetScrollChild(detail.content)
@@ -938,7 +945,18 @@ local function CreateDetail()
     end
     detail.blocks = {}
 
-    local exportButton = CreateButton(detail, "COPY / EXPORT", 120, function()
+    -- upper row: report workflow
+    local reportButton = CreateButton(detail, "REPORT TO BLIZZARD", 150, function()
+        UI.ShowReport(detail.incidentId)
+    end)
+    reportButton:SetPoint("BOTTOMLEFT", PADDING, PADDING + BUTTON_HEIGHT + BUTTON_GAP)
+    detail.markButton = CreateButton(detail, "MARK AS REPORTED", 150, function()
+        UI.ToggleReported(detail.incidentId)
+    end)
+    detail.markButton:SetPoint("LEFT", reportButton, "RIGHT", BUTTON_GAP, 0)
+
+    -- lower row: data
+    local exportButton = CreateButton(detail, "FULL EXPORT", 110, function()
         local incident = ns.FindIncident(detail.incidentId)
         if incident then
             UI.ShowExport(ns.FormatIncidentText(incident), "Export - Incident " .. ns.FormatId(incident.id))
@@ -993,12 +1011,13 @@ local function CreateExport()
         defaultPosition = { point = "CENTER", relativePoint = "CENTER", x = 0, y = 20 },
     })
 
-    local hint = CreateText(exportFrame, "GameFontDisableSmall")
-    hint:SetPoint("TOPLEFT", PADDING + 2, -CONTENT_TOP)
-    hint:SetText("Text is selected: press Ctrl+C to copy, Esc to close.")
+    exportFrame.hint = CreateText(exportFrame, "GameFontHighlightSmall")
+    exportFrame.hint:SetPoint("TOPLEFT", PADDING + 2, -CONTENT_TOP)
+    exportFrame.hint:SetWidth(540 - 2 * PADDING - 4)
+    exportFrame.hint:SetJustifyV("TOP")
+    exportFrame.hint:SetSpacing(2)
 
     local area = CreateTextArea(exportFrame, 0)
-    area:SetPoint("TOPLEFT", PADDING, -CONTENT_TOP - 18)
     area:SetPoint("BOTTOMRIGHT", -PADDING, PADDING + BUTTON_HEIGHT + 8)
     exportFrame.area = area
 
@@ -1020,12 +1039,33 @@ local function CreateExport()
     selectButton:SetPoint("BOTTOMLEFT", PADDING, PADDING)
     local closeButton = CreateButton(exportFrame, "CLOSE", 80, function() exportFrame:Hide() end)
     closeButton:SetPoint("BOTTOMRIGHT", -PADDING, PADDING)
+    exportFrame.actionButton = CreateButton(exportFrame, "", 160, function()
+        if exportFrame.onAction then
+            exportFrame.onAction()
+        end
+    end)
+    exportFrame.actionButton:SetPoint("RIGHT", closeButton, "LEFT", -BUTTON_GAP, 0)
 
     exportFrame:SetScript("OnHide", function()
         edit:ClearFocus()
-        exportFrame.text = nil
+        exportFrame.text, exportFrame.reportId, exportFrame.onAction = nil, nil, nil
         edit:SetText("") -- release large export strings
     end)
+end
+
+local DEFAULT_EXPORT_HINT = "Text is selected: press Ctrl+C to copy, Esc to close."
+
+-- Hint text above the box (its height moves the box) and an optional action button.
+local function SetExportChrome(hint, actionLabel, onAction)
+    exportFrame.hint:SetText(hint or DEFAULT_EXPORT_HINT)
+    local area = exportFrame.area
+    area:ClearAllPoints()
+    area:SetPoint("TOPLEFT", PADDING, -CONTENT_TOP - exportFrame.hint:GetStringHeight() - 6)
+    area:SetPoint("BOTTOMRIGHT", -PADDING, PADDING + BUTTON_HEIGHT + 8)
+    exportFrame.onAction = onAction
+    exportFrame.actionButton:SetText(actionLabel or "")
+    exportFrame.actionButton:SetShown(actionLabel ~= nil)
+    exportFrame.actionButton:SetEnabled(not ns.readOnlyReason)
 end
 
 function UI.ShowExport(text, title)
@@ -1034,6 +1074,8 @@ function UI.ShowExport(text, title)
     end
     exportFrame.titleText:SetText(title or "EXPORT")
     exportFrame.text = text
+    exportFrame.reportId = nil
+    SetExportChrome(nil) -- plain export; UI.ShowReport adds the report chrome
     local edit = exportFrame.area.edit
     edit:SetText(text)
     ShowWindow(exportFrame)
@@ -1042,6 +1084,72 @@ function UI.ShowExport(text, title)
     edit:SetFocus()
     edit:SetCursorPosition(0)
     edit:HighlightText()
+end
+
+------------------------------------------------------------------------
+-- Report to Blizzard: the export window showing the compact Issue Reporter
+-- text, short instructions and the explicit MARK AS REPORTED fallback.
+------------------------------------------------------------------------
+
+local REPORT_STEPS = "1) Ctrl+C   2) Issue Reporter: click its bug icon   3) Ctrl+V into the description, then Submit."
+
+local function ReportHint(incident, letters)
+    local reporter = ns.BlizzardReporter
+    local detection
+    if not reporter.IsAvailable() then
+        detection = ns.Colorize(ns.COLOR_WARNING, "Issue Reporter not found in this client.")
+            .. " Send the text another way, then use MARK AS REPORTED."
+    elseif reporter.CanDetectSubmission() then
+        detection = format("Submitting is detected automatically while the text keeps %s.", ns.ReportRef(incident))
+    else
+        detection = "Submission cannot be detected in this client: after sending, use MARK AS REPORTED."
+    end
+    local status = ns.ReportTag(incident, true)
+    if ns.IsReported(incident) then
+        status = format("%s (%s)", status, ns.FormatDateTime(incident.report.reportedAt) or "N/A")
+    end
+    return format("%s\n%s\nStatus: %s     %d/%d letters", REPORT_STEPS, detection, status, letters, ns.REPORT_MAX_LETTERS)
+end
+
+local function RefreshReportChrome()
+    local incident = exportFrame.reportId and ns.FindIncident(exportFrame.reportId)
+    if not incident then
+        exportFrame:Hide() -- deleted while open
+        return
+    end
+    local id = incident.id
+    SetExportChrome(ReportHint(incident, exportFrame.reportLetters),
+        ns.IsReported(incident) and "MARK NOT REPORTED" or "MARK AS REPORTED",
+        function() UI.ToggleReported(id) end)
+end
+
+function UI.ShowReport(id)
+    local incident = id and ns.FindIncident(id)
+    if not incident then
+        ns.Print(format("Incident %s not found.", ns.FormatId(id)))
+        return
+    end
+    local text, letters = ns.FormatBlizzardReport(incident)
+    UI.ShowExport(text, "REPORT " .. ns.FormatId(incident.id) .. " TO BLIZZARD")
+    exportFrame.reportId, exportFrame.reportLetters = incident.id, letters
+    RefreshReportChrome()
+end
+
+-- Explicit user action (button click): flips reported <-> not reported.
+function UI.ToggleReported(id)
+    local incident = id and ns.FindIncident(id)
+    if not incident then
+        ns.Print(format("Incident %s not found.", ns.FormatId(id)))
+        return
+    end
+    local ok, err
+    if ns.IsReported(incident) then
+        ok, err = ns.MarkNotReported(id)
+    else
+        ok, err = ns.MarkReported(id)
+    end
+    ns.Print(ok and format("Incident %s marked as %s.", ns.FormatId(id),
+        ns.IsReported(incident) and "reported" or "not reported") or err)
 end
 
 ------------------------------------------------------------------------
@@ -1110,6 +1218,9 @@ function UI.OnModelChanged(topic)
         end
         if detail and detail:IsShown() then
             RenderDetail(false)
+        end
+        if exportFrame and exportFrame:IsShown() and exportFrame.reportId then
+            RefreshReportChrome()
         end
     elseif topic == "session" then
         UpdateIncidentSummary()

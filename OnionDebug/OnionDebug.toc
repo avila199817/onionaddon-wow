@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: OnionDebug
-## Notes: Personal QA/debugging toolkit: freeze the game context when you spot a bug, keep an incident history and export text for bug reports.
-## Version: 2.0.0
+## Notes: Personal QA/debugging toolkit: freeze the game context when you spot a bug, keep an incident history, and track which incidents you reported through Blizzard's Issue Reporter.
+## Version: 2.1.0
 ## SavedVariables: OnionDebugDB
 
 OnionDebug.lua

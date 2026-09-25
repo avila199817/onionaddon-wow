@@ -17,7 +17,7 @@ local IsSecret = issecretvalue -- 12.x-engine clients only; nil elsewhere
 -- Constants
 ------------------------------------------------------------------------
 
-local SCHEMA_VERSION = 2
+local SCHEMA_VERSION = 3
 
 local DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 local CLOCK_FORMAT = "%H:%M:%S"
@@ -52,6 +52,7 @@ ns.CATEGORY_COLORS = {
     lua = "ff4040",
 }
 
+ns.REPORT_COLORS = { reported = "66d98c", ["local"] = "a6a6a6" }
 ns.COLOR_LABEL = "999999"
 ns.COLOR_MUTED = "808080"
 ns.COLOR_WARNING = "ff9933"
@@ -84,7 +85,7 @@ local KNOWN_INCIDENT_FIELDS = {
     createdAt = "number", createdAtText = "string",
     client = "table", character = "table", location = "table", performance = "table",
     player = "table", target = "table", lastEvent = "table", recentEvents = "table",
-    metadata = "table",
+    metadata = "table", report = "table",
 }
 
 -- Expected field types inside each snapshot block ("scalar" = string or number).
@@ -107,8 +108,12 @@ local SECTION_FIELDS = {
     metadata = { addonVersion = "scalar", schemaVersion = "scalar", sessionId = "scalar", sessionUptime = "number",
         serverTime = "number", addOns = "table", restrictedValues = "number", migratedFromSchema = "scalar",
         originalId = "scalar" },
+    -- mutable report-tracking metadata; everything above is the frozen snapshot
+    report = { status = "string", provider = "scalar", method = "scalar", reportedAt = "number", history = "table",
+        legacyStatus = "scalar" },
 }
-local SECTION_ORDER = { "client", "character", "location", "performance", "player", "target", "metadata" }
+local SECTION_ORDER = { "client", "character", "location", "performance", "player", "target", "metadata", "report" }
+local REPORT_HISTORY_FIELDS = { status = "string", method = "scalar", at = "number" }
 local EVENT_FIELDS = { time = "number", offset = "number", event = "scalar", category = "scalar", info = "scalar", count = "number" }
 
 local VALID_POINTS = {
@@ -205,31 +210,45 @@ local function Truncate(text, maxLength)
 end
 ns.Truncate = Truncate
 
--- Byte index just past the first `count` letters, counted the way
--- EditBox:SetMaxLetters counts them (UTF-8 characters; the escaped pipe
--- "||" typed by the user is one letter). Nil if the text is not longer.
+-- Byte index of the letter after the one starting at `index`, counting letters
+-- the way EditBox:SetMaxLetters does (UTF-8 characters; the escaped pipe "||"
+-- typed by the user is one letter).
+local function NextLetter(text, index)
+    local byte = text:byte(index)
+    if byte == 124 and text:byte(index + 1) == 124 then
+        return index + 2
+    elseif byte >= 0xF0 then
+        return index + 4
+    elseif byte >= 0xE0 then
+        return index + 3
+    elseif byte >= 0xC0 then
+        return index + 2
+    end
+    return index + 1
+end
+
+-- Byte index just past the first `count` letters; nil if the text is not longer.
 local function LetterBoundary(text, count)
-    local index, length, letters = 1, #text, 0
-    while index <= length do
+    local index, letters = 1, 0
+    while index <= #text do
         if letters == count then
             return index - 1
         end
-        local byte = text:byte(index)
-        if byte == 124 and text:byte(index + 1) == 124 then
-            index = index + 2
-        elseif byte >= 0xF0 then
-            index = index + 4
-        elseif byte >= 0xE0 then
-            index = index + 3
-        elseif byte >= 0xC0 then
-            index = index + 2
-        else
-            index = index + 1
-        end
+        index = NextLetter(text, index)
         letters = letters + 1
     end
     return nil
 end
+
+local function LetterCount(text)
+    local index, letters = 1, 0
+    while index <= #text do
+        index = NextLetter(text, index)
+        letters = letters + 1
+    end
+    return letters
+end
+ns.LetterCount = LetterCount
 
 -- Letter-based truncation for user-typed text, so a title or note that the
 -- form accepted is never cut on save.
@@ -1000,6 +1019,7 @@ function ns.SaveIncident(snapshot, title, notes, severity)
     snapshot.title = TruncateLetters(title, ns.TITLE_MAX_LETTERS)
     snapshot.notes = notes ~= "" and TruncateLetters(notes, ns.NOTES_MAX_LETTERS) or nil
     snapshot.severity = SEVERITY_SET[severity] and severity or ns.DEFAULT_SEVERITY
+    snapshot.report = ns.NewReportState()
     db.incidents[#db.incidents + 1] = snapshot
 
     if ns.draft == snapshot then
@@ -1046,8 +1066,162 @@ function ns.IncidentMatches(incident, needle)
         tostring(Scalar(target.name) or ""),
         tostring(Scalar(target.npcId) or ""),
         tostring(ns.FormatBuild(Sub(incident, "client")) or ""),
+        ns.IsReported(incident) and "reported" or "local",
+        ns.ReportRef(incident),
     }, "\n"):lower()
     return haystack:find(needle, 1, true) ~= nil
+end
+
+------------------------------------------------------------------------
+-- Report tracking
+-- incident.report is mutable metadata about the transport to Blizzard. It is
+-- kept apart from the frozen snapshot: changing it never touches other fields.
+--   status     "local" | "reported"
+--   provider   "blizzard"
+--   method     "detected" (Issue Reporter submission carried the incident
+--              reference) | "manual" (user confirmed); only while reported
+--   reportedAt epoch of the current "reported" mark
+--   history    bounded log of status changes { status, method, at }
+------------------------------------------------------------------------
+
+local REPORT_LOCAL, REPORT_REPORTED = "local", "reported"
+local REPORT_HISTORY_MAX = 20
+ns.REPORT_METHOD_LABELS = {
+    detected = "detected: Issue Reporter submission contained the incident reference",
+    manual = "marked manually",
+}
+
+function ns.NewReportState()
+    return { status = REPORT_LOCAL, provider = "blizzard" }
+end
+
+function ns.IsReported(incident)
+    local report = incident.report
+    return type(report) == "table" and report.status == REPORT_REPORTED
+end
+
+-- Unique token placed at the start of the Blizzard report text. Finding it in
+-- a submitted bug report identifies exactly which incident was sent.
+function ns.ReportRef(incident)
+    local created = incident.createdAt
+    if type(created) ~= "number" or created ~= created or created < 0 or created >= 2 ^ 31 then
+        created = 0
+    end
+    return format("OD-%04d-%d", tonumber(incident.id) or 0, floor(created))
+end
+
+local function SetReportStatus(incident, status, method)
+    if ns.readOnlyReason then
+        return false, ns.readOnlyReason
+    end
+    local report = incident.report
+    if type(report) ~= "table" then
+        return false, format("Incident %s has no report metadata.", ns.FormatId(incident.id))
+    end
+    if report.status == status then
+        return false, format("Incident %s is already %s.", ns.FormatId(incident.id),
+            status == REPORT_REPORTED and "marked as reported" or "not reported")
+    end
+    local now = time()
+    report.status, report.provider = status, "blizzard"
+    if status == REPORT_REPORTED then
+        report.reportedAt, report.method = now, method
+    else
+        report.reportedAt, report.method = nil, nil -- the previous mark stays in history
+    end
+    if type(report.history) ~= "table" then
+        report.history = {}
+    end
+    local history = report.history
+    history[#history + 1] = { status = status, method = method, at = now }
+    while #history > REPORT_HISTORY_MAX do
+        remove(history, 1)
+    end
+    NotifyUI("incidents")
+    return true
+end
+
+-- Explicit user confirmation that the incident was sent to Blizzard.
+function ns.MarkReported(id)
+    local incident = ns.FindIncident(id)
+    if not incident then
+        return false, format("Incident %s not found.", ns.FormatId(id))
+    end
+    return SetReportStatus(incident, REPORT_REPORTED, "manual")
+end
+
+-- Undo a mark (e.g. set by mistake). The snapshot and the history are kept.
+function ns.MarkNotReported(id)
+    local incident = ns.FindIncident(id)
+    if not incident then
+        return false, format("Incident %s not found.", ns.FormatId(id))
+    end
+    return SetReportStatus(incident, REPORT_LOCAL, nil)
+end
+
+function ns.CountUnreported()
+    local count = 0
+    for _, incident in ipairs(ns.db.incidents) do
+        if not ns.IsReported(incident) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+------------------------------------------------------------------------
+-- Blizzard Issue Reporter (transport)
+-- The official reporter is Blizzard's Blizzard_PTRFeedback addon (Beta/PTR
+-- only). It has no public API to open it or pre-fill text, so OnionDebug never
+-- calls its internals. Every bug it sends goes through the documented
+-- C_UserFeedback.SubmitBug(bugInfo); a post-hook (hooksecurefunc, no taint on
+-- Blizzard's path) reads the submitted text, and an incident is marked
+-- reported only when that text contains its unique reference.
+------------------------------------------------------------------------
+
+local BlizzardReporter = { hooked = false }
+ns.BlizzardReporter = BlizzardReporter
+
+function BlizzardReporter.IsAvailable()
+    local isLoaded = (C_AddOns and C_AddOns.IsAddOnLoaded) or IsAddOnLoaded
+    if isLoaded and isLoaded("Blizzard_PTRFeedback") then
+        return true
+    end
+    return type(PTR_IssueReporter) == "table"
+end
+
+function BlizzardReporter.CanDetectSubmission()
+    return BlizzardReporter.hooked
+end
+
+local function OnBugSubmitted(bugInfo)
+    if (IsSecret and IsSecret(bugInfo)) or type(bugInfo) ~= "string" or not ns.db or ns.readOnlyReason then
+        return
+    end
+    for idText, createdText in bugInfo:gmatch("OD%-(%d+)%-(%d+)") do
+        local incident = ns.FindIncident(tonumber(idText))
+        if incident and not ns.IsReported(incident) and ns.ReportRef(incident) == ("OD-" .. idText .. "-" .. createdText) then
+            if SetReportStatus(incident, REPORT_REPORTED, "detected") then
+                ns.Print(format("Incident %s marked as reported: the Issue Reporter submission contained %s.",
+                    ns.FormatId(incident.id), ns.ReportRef(incident)))
+            end
+        end
+    end
+end
+
+function BlizzardReporter.InstallSubmitHook()
+    if BlizzardReporter.hooked or type(hooksecurefunc) ~= "function"
+        or type(C_UserFeedback) ~= "table" or type(C_UserFeedback.SubmitBug) ~= "function" then
+        return
+    end
+    hooksecurefunc(C_UserFeedback, "SubmitBug", function(bugInfo)
+        -- An error here must not abort Blizzard's submit handler; report it instead.
+        local ok, err = pcall(OnBugSubmitted, bugInfo)
+        if not ok and geterrorhandler then
+            geterrorhandler()(err)
+        end
+    end)
+    BlizzardReporter.hooked = true
 end
 
 ------------------------------------------------------------------------
@@ -1152,6 +1326,29 @@ function ns.FormatRow(label, value, useColor)
         return Colorize(ns.COLOR_LABEL, label .. ":") .. " " .. value
     end
     return label .. ": " .. value
+end
+
+-- Text-first (not colour-only) report state: "REPORTED" / "LOCAL".
+function ns.ReportTag(incident, useColor)
+    if ns.IsReported(incident) then
+        return useColor and Colorize(ns.REPORT_COLORS.reported, "REPORTED") or "REPORTED"
+    end
+    return useColor and Colorize(ns.REPORT_COLORS["local"], "LOCAL") or "LOCAL"
+end
+
+function ns.FormatReportStatus(incident, useColor)
+    local text = ns.IsReported(incident) and "Reported to Blizzard" or "Local only (not reported)"
+    if useColor then
+        return Colorize(ns.IsReported(incident) and ns.REPORT_COLORS.reported or ns.REPORT_COLORS["local"], text)
+    end
+    return text
+end
+
+function ns.FormatReportHistoryEntry(entry)
+    local action = entry.status == "reported" and "marked reported" or entry.status == "local" and "marked not reported"
+        or ("status " .. Display(Scalar(entry.status)))
+    local method = Scalar(entry.method)
+    return format("%s %s%s", ns.FormatDateTime(entry.at) or NA, action, method and (" (" .. method .. ")") or "")
 end
 
 function ns.FormatSeverity(severity, useColor)
@@ -1342,13 +1539,35 @@ function ns.DescribeIncident(incident, useColor)
     local target, performance = TypedSection(incident, "target"), TypedSection(incident, "performance")
     local metadata = TypedSection(incident, "metadata")
 
+    local report = TypedSection(incident, "report")
+    local reportHistory = Sub(report, "history")
     if incident.id then
         Section("Title")[1] = Display(incident.title)
         local summary = Section(nil)
-        summary[1] = { "Severity", ns.FormatSeverity(type(incident.severity) == "string" and incident.severity or nil, useColor) }
+        Row(summary, "Incident", format("%s (ref %s)", ns.FormatId(incident.id), ns.ReportRef(incident)))
+        summary[#summary + 1] = { "Severity", ns.FormatSeverity(type(incident.severity) == "string" and incident.severity or nil, useColor) }
         Row(summary, "Created", type(incident.createdAtText) == "string" and incident.createdAtText or ns.FormatDateTime(incident.createdAt))
+        summary[#summary + 1] = { "Report status", ns.FormatReportStatus(incident, useColor) }
+        if report.status == REPORT_REPORTED or report.reportedAt then
+            Row(summary, "Reported at", ns.FormatDateTime(report.reportedAt))
+        end
+        if report.method ~= nil then
+            Row(summary, "Report method", ns.REPORT_METHOD_LABELS[report.method] or report.method)
+        end
+        if report.provider ~= nil and report.provider ~= "blizzard" then
+            Row(summary, "Report provider", report.provider)
+        end
+        if report.legacyStatus ~= nil then
+            Row(summary, "Previous report status", report.legacyStatus)
+        end
         local notes = Section("Notes")
         notes[1] = (type(incident.notes) == "string" and incident.notes ~= "") and incident.notes or "(none)"
+        if ListLength(reportHistory) > 0 then
+            local historyRows = Section("Report history")
+            for _, entry in ipairs(reportHistory) do
+                historyRows[#historyRows + 1] = type(entry) == "table" and ns.FormatReportHistoryEntry(entry) or Display(entry)
+            end
+        end
     else
         Row(Section(nil), "Captured", type(incident.createdAtText) == "string" and incident.createdAtText or nil)
     end
@@ -1493,6 +1712,7 @@ function ns.DescribeIncident(incident, useColor)
         AppendLeftovers(other, "lastEvent", lastEvent, EVENT_FIELDS, 2)
     end
     AppendListLeftovers(other, "recentEvents", recentEvents, function() return true end, EVENT_FIELDS, 2)
+    AppendListLeftovers(other, "report.history", reportHistory, function() return true end, REPORT_HISTORY_FIELDS, 3)
     if #other > 0 then
         rows = Section("Other fields")
         for index, row in ipairs(other) do
@@ -1533,6 +1753,152 @@ function ns.FormatIncidentsText(incidents)
         parts[#parts + 1] = ns.FormatIncidentText(incident)
     end
     return concat(parts, "\n\n")
+end
+
+------------------------------------------------------------------------
+-- Blizzard report text
+-- What gets pasted into the Issue Reporter's description box. That box is an
+-- EditBox limited to 255 letters (AttachStandaloneQuestion default in
+-- Blizzard_PTRFeedback) and the reporter turns commas into spaces, so the text
+-- is compact, comma-free and starts with the incident reference (which is what
+-- submission detection looks for). The reporter already attaches character
+-- level/race/class/faction and map ID itself, so those are not repeated.
+-- Privacy: no character name/realm, other players' names, GUIDs, addon list
+-- or session data here; the full export keeps everything locally.
+------------------------------------------------------------------------
+
+ns.REPORT_MAX_LETTERS = 255
+local REPORT_TITLE_MAX_LETTERS = 90
+local REPORT_NOTES_MIN_LETTERS = 80 -- optional context lines are dropped before notes shrink below this
+local REPORT_EVENT_INFO_MAX_LETTERS = 60
+local REPORT_USEFUL_CATEGORIES = { error = true, lua = true, taint = true }
+local REPORT_NOISE_EVENTS = {
+    PLAYER_LOGIN = true, PLAYER_ENTERING_WORLD = true, PLAYER_LEAVING_WORLD = true,
+    BAG_UPDATE_DELAYED = true, QUEST_LOG_UPDATE = true,
+}
+
+local function ReportSafe(text)
+    return (tostring(text):gsub(",", ";"):gsub("[\r\n]+", " "))
+end
+
+-- Most useful recent event: newest error/Lua/taint event, else newest non-noise event.
+local function ReportEvent(incident)
+    local fallback
+    local candidates = Sub(incident, "recentEvents")
+    if ListLength(candidates) == 0 and type(incident.lastEvent) == "table" then
+        candidates = { incident.lastEvent }
+    end
+    for _, entry in ipairs(candidates) do
+        local event = type(entry) == "table" and Scalar(entry.event)
+        if event then
+            if REPORT_USEFUL_CATEGORIES[entry.category] then
+                return entry
+            end
+            if not fallback and not REPORT_NOISE_EVENTS[event] then
+                fallback = entry
+            end
+        end
+    end
+    return fallback
+end
+
+local function ReportContextLines(incident)
+    local location, target = TypedSection(incident, "location"), TypedSection(incident, "target")
+    local performance = TypedSection(incident, "performance")
+    local lines = {}
+
+    local where = {}
+    where[#where + 1] = ns.FormatBuild(TypedSection(incident, "client"))
+    if location.zone or location.subZone then
+        where[#where + 1] = ns.FormatZone(location)
+    end
+    if location.instanceName then
+        where[#where + 1] = format("%s (%s)", location.instanceName, Display(location.difficulty))
+    end
+    if location.x and location.y then
+        where[#where + 1] = format("at %.2f %.2f", location.x, location.y) -- the reporter adds the map ID itself
+    end
+    if #where > 0 then
+        lines[#lines + 1] = concat(where, "; ")
+    end
+
+    if target.exists or target.name or target.npcId or target.objectId then
+        local who
+        if target.isPlayer then
+            who = "a player" -- other players' names stay local
+        elseif target.npcId then
+            who = format("%s (NPC %s)", Display(target.name), target.npcId)
+        elseif target.objectId then
+            who = format("%s (object %s)", Display(target.name), target.objectId)
+        else
+            who = Display(target.name)
+        end
+        lines[#lines + 1] = "Target: " .. who
+    end
+
+    local entry = ReportEvent(incident)
+    if entry then
+        local info = Scalar(entry.info)
+        lines[#lines + 1] = format("Event: %s%s%s%s", entry.event,
+            info and (" " .. TruncateLetters(tostring(info), REPORT_EVENT_INFO_MAX_LETTERS)) or "",
+            (type(entry.count) == "number" and entry.count > 1) and format(" x%d", entry.count) or "",
+            type(entry.offset) == "number" and format(" %+.1fs", entry.offset) or "")
+    end
+
+    local perf = {}
+    if performance.fps then
+        perf[#perf + 1] = format("FPS %s%s", performance.fps,
+            performance.fpsMin and (" (min " .. performance.fpsMin .. ")") or "")
+    end
+    if performance.homeLatency or performance.worldLatency then
+        perf[#perf + 1] = format("ping %s/%sms", Display(performance.homeLatency), Display(performance.worldLatency))
+    end
+    if #perf > 0 then
+        lines[#lines + 1] = concat(perf, "; ")
+    end
+
+    for index, line in ipairs(lines) do
+        lines[index] = ReportSafe(line)
+    end
+    return lines
+end
+
+-- Returns the report text and its letter count (always <= REPORT_MAX_LETTERS).
+function ns.FormatBlizzardReport(incident)
+    local budget = ns.REPORT_MAX_LETTERS
+    local severity = SEVERITY_SET[incident.severity] and incident.severity ~= ns.DEFAULT_SEVERITY and incident.severity
+    local title = ReportSafe(TruncateLetters(ns.Trim(Scalar(incident.title) or "Untitled incident"), REPORT_TITLE_MAX_LETTERS))
+    local head = format("[%s]%s %s", ns.ReportRef(incident), severity and ("[" .. severity .. "]") or "", title)
+    local notes = ns.Trim(Scalar(incident.notes) or ""):gsub(",", ";")
+    local context = ReportContextLines(incident)
+
+    local function Length(lines)
+        local total = LetterCount(head)
+        for _, line in ipairs(lines) do
+            total = total + 1 + LetterCount(line) -- newline + line
+        end
+        return total
+    end
+
+    -- Drop the least important context lines while they squeeze the notes too much.
+    local room = budget - Length(context) - 1
+    while #context > 0 and notes ~= "" and LetterCount(notes) > room and room < REPORT_NOTES_MIN_LETTERS + 3 do -- + "..."
+        context[#context] = nil
+        room = budget - Length(context) - 1
+    end
+
+    local lines = { head }
+    if notes ~= "" and room > 3 then
+        lines[#lines + 1] = TruncateLetters(notes, room)
+    end
+    for _, line in ipairs(context) do
+        lines[#lines + 1] = line
+    end
+    local text = concat(lines, "\n")
+    if LetterCount(text) > budget then
+        text = TruncateLetters(text, budget) -- the reference stays: it comes first
+    end
+    return text, LetterCount(text)
 end
 
 ------------------------------------------------------------------------
@@ -1643,7 +2009,41 @@ local function NormalizeSettings(db)
     end
 end
 
+-- Stores a value that has to make room without losing it: key, key2, key3...
+local function PreserveValue(tbl, key, value)
+    local slot, suffix = key, 1
+    while tbl[slot] ~= nil do
+        suffix = suffix + 1
+        slot = key .. suffix
+    end
+    tbl[slot] = value
+end
+
+-- Every incident carries report metadata (schema 3). Missing -> "local";
+-- anything unusable is preserved (legacyReport / report.legacyStatus), never dropped.
+local function NormalizeReport(incident)
+    local report = incident.report
+    if type(report) ~= "table" then
+        if report ~= nil then
+            PreserveValue(incident, "legacyReport", report)
+        end
+        incident.report = ns.NewReportState()
+    else
+        if report.status ~= REPORT_LOCAL and report.status ~= REPORT_REPORTED then
+            if report.status ~= nil then
+                PreserveValue(report, "legacyStatus", report.status)
+            end
+            report.status = REPORT_LOCAL
+        end
+        if report.history ~= nil and type(report.history) ~= "table" then
+            PreserveValue(report, "legacyHistory", report.history)
+            report.history = nil
+        end
+    end
+end
+
 local function NormalizeIncident(incident)
+    NormalizeReport(incident)
     if type(incident.title) ~= "string" or ns.Trim(incident.title) == "" then
         local fallback = incident.name or incident.summary
         incident.title = (type(fallback) == "string" and ns.Trim(fallback) ~= "") and fallback or "Untitled incident"
@@ -1792,8 +2192,15 @@ local function MigrateV1ToV2(db)
     end
 end
 
+-- Schema 3 adds incident.report (report tracking). The default state is applied
+-- by NormalizeReport, which ValidateDatabase runs for every incident on every
+-- load, so this step has nothing else to change and is trivially idempotent.
+local function MigrateV2ToV3()
+end
+
 local MIGRATIONS = {
     [1] = MigrateV1ToV2,
+    [2] = MigrateV2ToV3,
 }
 
 -- Returns the schema version the data was migrated from, or nil.
@@ -1925,6 +2332,10 @@ local function PrintStatus()
             #unavailable > 0 and (" (unavailable: " .. concat(unavailable, ", ") .. ")") or ""))
     end
     ns.Print(format("Lua error capture: %s", ns.GetLuaCaptureState()))
+    ns.Print(format("Blizzard Issue Reporter: %s; submission detection %s; %d incident%s not reported",
+        BlizzardReporter.IsAvailable() and "available" or "not found",
+        BlizzardReporter.CanDetectSubmission() and "active" or "unavailable",
+        ns.CountUnreported(), ns.CountUnreported() == 1 and "" or "s"))
     ns.Print(format("SavedVariables: %s", ns.readOnlyReason and "newer schema on disk - read-only session, nothing is saved"
         or ns.dbLoadedFromDisk and "loaded from disk" or "new database this session"))
     if type(db.quarantine) == "table" and #db.quarantine > 0 then
@@ -2003,6 +2414,36 @@ COMMANDS = {
             return
         end
         ns.UI.ConfirmDelete(incident.id)
+    end },
+    { name = "report", args = "<id|last>", help = "Prepare the Blizzard Issue Reporter text for an incident", run = function(argument)
+        local incident, err = ResolveIncident(argument, "/od report <id|last>")
+        if not incident then
+            ns.Print(err)
+            return
+        end
+        ns.UI.ShowReport(incident.id)
+    end },
+    { name = "reported", args = "<id|last>", help = "Mark an incident as reported to Blizzard", run = function(argument)
+        local incident, err = ResolveIncident(argument, "/od reported <id|last>")
+        if incident then
+            local ok
+            ok, err = ns.MarkReported(incident.id)
+            if ok then
+                err = format("Incident %s marked as reported.", ns.FormatId(incident.id))
+            end
+        end
+        ns.Print(err)
+    end },
+    { name = "unreported", args = "<id|last>", help = "Undo a reported mark (history is kept)", run = function(argument)
+        local incident, err = ResolveIncident(argument, "/od unreported <id|last>")
+        if incident then
+            local ok
+            ok, err = ns.MarkNotReported(incident.id)
+            if ok then
+                err = format("Incident %s marked as not reported.", ns.FormatId(incident.id))
+            end
+        end
+        ns.Print(err)
     end },
     { name = "status", help = "Print diagnostics", run = PrintStatus },
     { name = "clear-events", aliases = { "clearevents" }, help = "Empty the event buffer", run = function()
@@ -2085,6 +2526,7 @@ local function OnAddonLoaded()
     if settings.captureLuaErrors then
         InstallLuaErrorCapture()
     end
+    BlizzardReporter.InstallSubmitHook()
     lifecycle:SetScript("OnUpdate", OnPerformanceUpdate)
     AnnounceDatabase()
 end

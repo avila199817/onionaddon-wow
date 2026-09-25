@@ -230,10 +230,16 @@ function Mock.Install(options)
     _G.GetBuildInfo = function() return "1.60.1", "70009", "Sep 24 2026", 16001, "1.60.1", "Release" end
     _G.GetLocale = function() return "esES" end
     _G.C_AddOns = {
-        GetAddOnMetadata = function(name, field) if name == "OnionDebug" and field == "Version" then return "2.0.0" end end,
+        GetAddOnMetadata = function(name, field) if name == "OnionDebug" and field == "Version" then return "2.1.0" end end,
         GetNumAddOns = function() return 3 end,
         GetAddOnInfo = function(i) return ({ "OnionDebug", "BugSack", "Disabled" })[i] end,
-        IsAddOnLoaded = function(i) return i ~= 3, i ~= 3 end,
+        IsAddOnLoaded = function(nameOrIndex)
+            if type(nameOrIndex) == "string" then
+                local loaded = nameOrIndex == "Blizzard_PTRFeedback" and not options.noIssueReporter
+                return loaded, loaded
+            end
+            return nameOrIndex ~= 3, nameOrIndex ~= 3
+        end,
     }
     _G.C_EventUtils = { IsEventValid = function(event) return state.validEvents[event] == true end }
     if options.noMapApi then
@@ -307,6 +313,27 @@ function Mock.Install(options)
     _G.wipe = function(t) for k in pairs(t) do t[k] = nil end return t end
     _G.tinsert = table.insert
     _G.geterrorhandler = function() return state.errorHandler end
+    -- Blizzard Issue Reporter (Blizzard_PTRFeedback) and its transport.
+    state.submittedBugs = {}
+    _G.PTR_IssueReporter = (not options.noIssueReporter) and Mock.NewWidget("Frame") or nil
+    _G.C_UserFeedback = (not options.noFeedbackApi) and {
+        SubmitBug = function(bugInfo, suppressNotification)
+            state.submittedBugs[#state.submittedBugs + 1] = bugInfo
+            return true
+        end,
+    } or nil
+    -- Real semantics: a post-hook that cannot change arguments or return values.
+    _G.hooksecurefunc = (not options.noHooksecurefunc) and function(tbl, name, hook)
+        if type(tbl) == "string" then
+            tbl, name, hook = _G, tbl, name
+        end
+        local original = assert(tbl[name], "hooksecurefunc: no function " .. tostring(name))
+        tbl[name] = function(...)
+            local results = { original(...) }
+            hook(...)
+            return unpack(results)
+        end
+    end or nil
     _G.seterrorhandler = function(fn) state.errorHandler = fn end
     _G.OnionDebugDB = options.db
     _G.SLASH_ONIONDEBUG1, _G.SLASH_ONIONDEBUG2, _G.SLASH_ONIONDEBUG3 = nil, nil, nil
@@ -354,6 +381,13 @@ function Mock.Advance(seconds)
     Mock.state.now = Mock.state.now + seconds
     Mock.state.uptime = Mock.state.uptime + seconds
     Mock.clock.now, Mock.clock.uptime = Mock.state.now, Mock.state.uptime
+end
+
+-- What Blizzard_PTRFeedback does when the player presses Submit: the survey
+-- string (comma separated) with the typed description, commas replaced.
+function Mock.SubmitIssueReport(description)
+    local userText = description:gsub(",", " ")
+    return C_UserFeedback.SubmitBug(string.format("[*WSS&^$&L],2,12,Alliance,1,0,1,0,0,0,,0,0,1453,%s", userText), false)
 end
 
 function Mock.Slash(text)
