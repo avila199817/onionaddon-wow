@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: OnionDebug
+## Notes: Personal QA/debugging toolkit: freeze the game context when you spot a bug, keep an incident history and export text for bug reports.
+## Version: 2.0.0
+## SavedVariables: OnionDebugDB
+
+OnionDebug.lua
+OnionDebugUI.lua
