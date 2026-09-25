@@ -330,12 +330,63 @@ Scenario("legacy nested fields are shown and never break formatting", function()
     Check(Contains(text, "location.coords: 32.1, 45.6") and Contains(text, "location.mapID.uiMapID: 1429"), "nested location fields exported")
     Check(Contains(text, "performance.latency: 27/31") and Contains(text, "createdAtText: 12"), "other mistyped fields exported")
     Check(Contains(text, "Name: Guard") and Contains(text, "Zone: Elwynn") and Contains(text, "Version: 1.12"), "valid fields still rendered")
-    Check(Contains(text, "09:41 ZONE_CHANGED") and Contains(text, "3 loaded: A, 5, true"), "legacy events and addon list rendered")
+    Check(Contains(text, "09:41 ZONE_CHANGED") and Contains(text, "2 loaded: A, 5")
+        and Contains(text, "metadata.addOns[3]: Yes"), "legacy events and addon list rendered")
+    Check(Contains(text, "recentEvents[2].info.1: 1"), "mistyped event info exported")
     Check(pcall(ns.FormatIncidentsText, { incident }), "export all works")
     Check(pcall(ns.FormatIncidentMeta, incident, true) and pcall(ns.IncidentMatches, incident, "x"), "history row and search work")
     ns.UI.ShowHistory()
     ns.UI.ShowDetail(1)
     Check(_G.OnionDebugDetail:IsShown(), "detail renders")
+end)
+
+Scenario("every stored field reaches the export (completeness)", function()
+    local ns = Mock.Boot(ROOT)
+    -- Each field gets a unique sentinel; each must appear somewhere in the text.
+    local incident = {
+        id = 7, title = "T_title", notes = "T_notes", severity = "High", createdAt = 1780000000, createdAtText = "T_created",
+        client = { version = "C_version", build = "C_build", buildDate = "C_date", tocVersion = 910001, locale = "C_locale" },
+        character = { realm = "CH_realm", class = "CH_class", classToken = "CH_token", race = "CH_race", level = 910002,
+            faction = "CH_faction" }, -- no name: realm must still show
+        location = { zone = "L_zone", subZone = "L_sub", mapName = "L_mapName", x = 910003, y = 910004,
+            instanceType = "L_type", difficulty = "L_diff", instanceMapID = 910005, worldX = 910006 }, -- no mapID, no instanceName, no worldY
+        performance = { fps = 910007, fpsAvg = 910008, fpsWindow = 910009, homeLatency = 910010,
+            worldLatency = 910011, luaMemoryKB = 1024 * 910012 }, -- no fpsMin
+        player = { combat = true },
+        target = { level = 910013, classification = "TG_class", guidType = "TG_type", reaction = 910014,
+            creatureType = "TG_ctype", guid = "TG_guid", npcId = 910015, objectId = 910016, name = "TG_name" }, -- no exists
+        metadata = { addonVersion = "M_ver", schemaVersion = 910017, sessionId = "M_session", sessionUptime = 3723,
+            serverTime = 1780000000, addOns = { "M_addon", extra = "M_map" }, restrictedValues = 910018,
+            migratedFromSchema = 910019, originalId = "M_orig", unknown = "M_unknown" },
+        lastEvent = { time = 1780000000, event = "E_last", info = "E_info", payload = "E_payload" },
+        recentEvents = { { event = "E_recent", args = { "E_arg" } }, "E_string", n = "E_n" },
+        topLevel = "X_top",
+    }
+    local text = ns.FormatIncidentText(incident)
+    local expected = {
+        "T_title", "T_notes", "High", "T_created", "C_version", "C_build", "C_date", "910001", "C_locale",
+        "CH_realm", "CH_class", "CH_token", "CH_race", "910002", "CH_faction",
+        "L_zone", "L_sub", "L_mapName", "910003", "910004", "L_type", "L_diff", "910005", "910006",
+        "910007", "910008", "910009", "910010", "910011", "910012.0 MB",
+        "910013", "TG_class", "TG_type", "910014", "TG_ctype", "TG_guid", "910015", "910016", "TG_name",
+        "M_ver", "910017", "M_session", "01:02:03", os.date("%Y-%m-%d", 1780000000), "M_addon", "M_map", "910018",
+        "910019", "M_orig", "M_unknown", "E_last", "E_info", "E_payload", "E_recent", "E_arg", "E_string", "E_n", "X_top",
+    }
+    local missing = {}
+    for _, needle in ipairs(expected) do
+        if not Contains(text, needle) then
+            missing[#missing + 1] = needle
+        end
+    end
+    Check(#missing == 0, "all stored values exported (missing: " .. table.concat(missing, ", ") .. ")")
+
+    local instance = ns.CaptureSnapshot()
+    instance.location.worldX, instance.location.worldY, instance.location.instanceMapID = nil, nil, 36
+    Check(Contains(ns.FormatIncidentText(instance), "Instance ID: 36"), "instance ID shown without world coordinates")
+
+    local zoneTable = { id = 1, title = "z", location = { zone = { name = "Elwynn" } } }
+    Check(not Contains(ns.FormatIncidentMeta(zoneTable, false), "table:") and not ns.IncidentMatches(zoneTable, "table"),
+        "non-scalar zone never rendered as a table address")
 end)
 
 Scenario("legacy ids renumbered chronologically, originals kept", function()

@@ -28,7 +28,7 @@ local LUA_ERROR_MAX_LENGTH = 300
 local EVENT_COALESCE_SECONDS = 2 -- identical consecutive events closer than this are merged (xN)
 local PERF_SAMPLE_INTERVAL = 1
 local PERF_WINDOW_SAMPLES = 30
-local OTHER_FIELDS_MAX_DEPTH = 4
+local OTHER_FIELDS_MAX_DEPTH = 8 -- only guards against pathological nesting
 local NA = "N/A"
 
 ns.SCHEMA_VERSION = SCHEMA_VERSION
@@ -109,6 +109,7 @@ local SECTION_FIELDS = {
         originalId = "scalar" },
 }
 local SECTION_ORDER = { "client", "character", "location", "performance", "player", "target", "metadata" }
+local EVENT_FIELDS = { time = "number", offset = "number", event = "scalar", category = "scalar", info = "scalar", count = "number" }
 
 local VALID_POINTS = {
     TOP = true, BOTTOM = true, LEFT = true, RIGHT = true, CENTER = true,
@@ -273,6 +274,14 @@ local function Display(value)
     return tostring(value)
 end
 ns.Display = Display
+
+local function Scalar(value)
+    local kind = type(value)
+    if kind == "string" or kind == "number" then
+        return value
+    end
+    return nil
+end
 
 local function Colorize(hex, text)
     return "|cff" .. hex .. text .. "|r"
@@ -1022,24 +1031,20 @@ function ns.DeleteIncident(id)
 end
 
 function ns.IncidentZone(incident)
-    local zone = Sub(incident, "location").zone
-    if zone == nil and type(incident.zone) == "string" then
-        zone = incident.zone -- legacy flat field
-    end
-    return zone
+    return Scalar(Sub(incident, "location").zone) or Scalar(incident.zone) -- second: legacy flat field
 end
 
 function ns.IncidentMatches(incident, needle)
     local location, target = Sub(incident, "location"), Sub(incident, "target")
     local haystack = concat({
         ns.FormatId(incident.id),
-        tostring(incident.title or ""),
-        tostring(incident.notes or ""),
-        tostring(incident.severity or ""),
+        tostring(Scalar(incident.title) or ""),
+        tostring(Scalar(incident.notes) or ""),
+        tostring(Scalar(incident.severity) or ""),
         tostring(ns.IncidentZone(incident) or ""),
-        tostring(location.subZone or ""),
-        tostring(target.name or ""),
-        tostring(target.npcId or ""),
+        tostring(Scalar(location.subZone) or ""),
+        tostring(Scalar(target.name) or ""),
+        tostring(Scalar(target.npcId) or ""),
         tostring(ns.FormatBuild(Sub(incident, "client")) or ""),
     }, "\n"):lower()
     return haystack:find(needle, 1, true) ~= nil
@@ -1164,12 +1169,12 @@ function ns.FormatEventLine(entry, useColor, showOffset)
     if showOffset and type(entry.offset) == "number" then
         line = line .. format(" (%+.1fs)", entry.offset)
     end
-    local name = tostring(entry.event or "?")
+    local name = tostring(Scalar(entry.event) or "?")
     if useColor then
         name = Colorize(ns.CATEGORY_COLORS[entry.category] or "ffffff", name)
     end
     line = line .. " " .. name
-    if entry.info ~= nil then
+    if Scalar(entry.info) ~= nil then
         line = line .. "  " .. tostring(entry.info)
     end
     if type(entry.count) == "number" and entry.count > 1 then
@@ -1235,6 +1240,26 @@ local function TypedSection(incident, section)
     return view
 end
 
+-- Numbers first (numerically), then everything else by text.
+local function KeyOrder(a, b)
+    local numberA, numberB = type(a) == "number", type(b) == "number"
+    if numberA and numberB then
+        return a < b
+    elseif numberA ~= numberB then
+        return numberA
+    end
+    return tostring(a) < tostring(b)
+end
+
+local function SortedKeys(tbl)
+    local keys = {}
+    for key in pairs(tbl) do
+        keys[#keys + 1] = key
+    end
+    sort(keys, KeyOrder)
+    return keys
+end
+
 local function FlattenValue(rows, label, value, depth)
     if type(value) ~= "table" then
         rows[#rows + 1] = { label, Display(value) }
@@ -1244,18 +1269,58 @@ local function FlattenValue(rows, label, value, depth)
         rows[#rows + 1] = { label, "{...}" }
         return
     end
-    local keys = {}
-    for key in pairs(value) do
-        keys[#keys + 1] = key
-    end
+    local keys = SortedKeys(value)
     if #keys == 0 then
         rows[#rows + 1] = { label, "{}" }
         return
     end
-    sort(keys, function(a, b) return tostring(a) < tostring(b) end)
     for _, key in ipairs(keys) do
         FlattenValue(rows, label .. "." .. tostring(key), value[key], depth + 1)
     end
+end
+
+-- Flattens every key of `block` that is not in `spec` or has another type.
+local function AppendLeftovers(rows, label, block, spec, depth)
+    for _, key in ipairs(SortedKeys(block)) do
+        local value = block[key]
+        if not (spec[key] and MatchesType(spec[key], value)) then
+            FlattenValue(rows, label .. "." .. tostring(key), value, depth)
+        end
+    end
+end
+
+local function ListLength(list)
+    local length = 0
+    for index in ipairs(list) do
+        length = index
+    end
+    return length
+end
+
+-- For list-shaped fields (recentEvents, addOns): flattens non-list keys and list
+-- entries that the rendered rows cannot show; `entrySpec` checks table entries.
+local function AppendListLeftovers(rows, label, list, isShown, entrySpec, depth)
+    local length = ListLength(list)
+    for _, key in ipairs(SortedKeys(list)) do
+        local value = list[key]
+        local inList = type(key) == "number" and key >= 1 and key <= length and key % 1 == 0
+        if not inList then
+            FlattenValue(rows, label .. "." .. tostring(key), value, depth)
+        elseif type(value) == "table" and entrySpec then
+            AppendLeftovers(rows, format("%s[%d]", label, key), value, entrySpec, depth + 1)
+        elseif not isShown(value) then
+            FlattenValue(rows, format("%s[%d]", label, key), value, depth + 1)
+        end
+    end
+end
+
+local function PairText(first, second, pattern)
+    if type(first) == "number" and type(second) == "number" then
+        return format(pattern, first, second)
+    elseif first ~= nil or second ~= nil then
+        return Display(first) .. " / " .. Display(second)
+    end
+    return nil
 end
 
 -- Structured, ordered description of an incident (or an unsaved snapshot).
@@ -1295,12 +1360,11 @@ function ns.DescribeIncident(incident, useColor)
     Row(rows, "TOC", client.tocVersion)
     Row(rows, "Locale", client.locale)
 
+    -- Every typed field below is shown whenever it is present, even if a
+    -- related field is missing; nothing stored may be hidden.
     rows = Section("Character")
-    local fullName = character.name
-    if fullName and character.realm then
-        fullName = fullName .. "-" .. character.realm
-    end
-    Row(rows, "Name", fullName)
+    Row(rows, "Name", (character.name or character.realm)
+        and (tostring(character.name or "?") .. (character.realm and ("-" .. character.realm) or "")) or nil)
     Row(rows, "Level", ns.FormatLevel(character.level))
     Row(rows, "Race", character.race)
     Row(rows, "Class", character.classToken and format("%s (%s)", character.class or "?", character.classToken) or character.class)
@@ -1309,14 +1373,17 @@ function ns.DescribeIncident(incident, useColor)
     rows = Section("Location")
     Row(rows, "Zone", location.zone)
     Row(rows, "Subzone", location.subZone)
-    Row(rows, "Map", location.mapID and format("%s (%s)", location.mapID, location.mapName or "?") or nil)
-    Row(rows, "Position", ns.FormatCoords(location.x, location.y))
-    if location.instanceName then
-        Row(rows, "Instance", format("%s (%s%s)", location.instanceName, location.instanceType or "?",
-            location.difficulty and (", " .. location.difficulty) or ""))
+    Row(rows, "Map", (location.mapID or location.mapName)
+        and format("%s (%s)", Display(location.mapID), location.mapName or "?") or nil)
+    Row(rows, "Position", PairText(location.x, location.y, "%.2f / %.2f"))
+    local instance = location.instanceType or location.instanceName or location.difficulty
+    if instance then
+        instance = format("%s%s%s", location.instanceName and (location.instanceName .. " - ") or "",
+            Display(location.instanceType), location.difficulty and (", " .. location.difficulty) or "")
     end
-    Row(rows, "World", (location.worldX and location.worldY)
-        and format("%.1f, %.1f (instance %s)", location.worldX, location.worldY, Display(location.instanceMapID)) or nil)
+    Row(rows, "Instance", instance)
+    Row(rows, "Instance ID", location.instanceMapID)
+    Row(rows, "World", PairText(location.worldX, location.worldY, "%.1f, %.1f"))
 
     rows = Section("Player")
     Row(rows, "Combat", player.combat)
@@ -1327,29 +1394,40 @@ function ns.DescribeIncident(incident, useColor)
     Row(rows, "Resting", player.resting)
 
     rows = Section("Target")
-    -- legacy incidents may lack `exists` but still carry target data
-    if target.exists or (target.exists == nil and (target.name or target.guid)) then
+    local hasTargetData = false
+    for key in pairs(target) do
+        if key ~= "exists" then
+            hasTargetData = true
+        end
+    end
+    if target.exists or hasTargetData then
         Row(rows, "Name", target.name)
         Row(rows, "Level", ns.FormatLevel(target.level))
         Row(rows, "Classification", target.classification)
-        Row(rows, "Kind", target.isPlayer and "Player" or target.guidType)
+        local kind = target.guidType
+        if target.isPlayer then
+            kind = (kind and kind ~= "Player") and ("Player / " .. kind) or "Player"
+        end
+        Row(rows, "Kind", kind)
         Row(rows, "Reaction", ns.FormatReaction(target.reaction))
         Row(rows, "Creature type", target.creatureType)
         Row(rows, "Dead", target.dead)
         Row(rows, "GUID", target.guid)
         if target.objectId then
             Row(rows, "Object ID", target.objectId)
-        else
+        end
+        if target.npcId or not target.objectId then
             Row(rows, "NPC ID", target.npcId)
         end
     else
-        rows[1] = target.exists == nil and next(target) == nil and NA or "No target"
+        rows[1] = target.exists == false and "No target" or NA
     end
 
     rows = Section("Performance")
     Row(rows, "FPS", performance.fps)
-    if performance.fpsMin then
-        Row(rows, "FPS window", format("min %s / avg %s (last %ss)", performance.fpsMin, Display(performance.fpsAvg), Display(performance.fpsWindow)))
+    if performance.fpsMin or performance.fpsAvg or performance.fpsWindow then
+        Row(rows, "FPS window", format("min %s / avg %s (last %ss)", Display(performance.fpsMin),
+            Display(performance.fpsAvg), Display(performance.fpsWindow)))
     end
     Row(rows, "Home latency", performance.homeLatency and (performance.homeLatency .. " ms") or nil)
     Row(rows, "World latency", performance.worldLatency and (performance.worldLatency .. " ms") or nil)
@@ -1359,10 +1437,13 @@ function ns.DescribeIncident(incident, useColor)
     Row(rows, "Session ID", metadata.sessionId)
     Row(rows, "Session uptime", metadata.sessionUptime and ns.FormatDuration(metadata.sessionUptime) or nil)
     Row(rows, "Server time", ns.FormatDateTime(metadata.serverTime))
-    Row(rows, "OnionDebug", metadata.addonVersion and format("%s (schema %s)", metadata.addonVersion, Display(metadata.schemaVersion)) or nil)
-    local addOns = {}
-    for index, name in ipairs(Sub(metadata, "addOns")) do
-        addOns[index] = tostring(name)
+    Row(rows, "OnionDebug", (metadata.addonVersion or metadata.schemaVersion)
+        and format("%s (schema %s)", Display(metadata.addonVersion), Display(metadata.schemaVersion)) or nil)
+    local addOnList, addOns = Sub(metadata, "addOns"), {}
+    for _, name in ipairs(addOnList) do
+        if Scalar(name) ~= nil then
+            addOns[#addOns + 1] = tostring(name)
+        end
     end
     Row(rows, "AddOns", format("%d loaded%s", #addOns, #addOns > 0 and (": " .. concat(addOns, ", ")) or ""))
     if metadata.restrictedValues then
@@ -1381,7 +1462,7 @@ function ns.DescribeIncident(incident, useColor)
     rows[1] = type(lastEvent) == "table" and ns.FormatEventLine(lastEvent, useColor, true) or "(none)"
 
     local recentEvents = Sub(incident, "recentEvents")
-    rows = Section(format("Recent events (%d, newest first)", #recentEvents))
+    rows = Section(format("Recent events (%d, newest first)", ListLength(recentEvents)))
     for _, entry in ipairs(recentEvents) do
         rows[#rows + 1] = type(entry) == "table" and ns.FormatEventLine(entry, useColor, true) or Display(entry)
     end
@@ -1389,34 +1470,24 @@ function ns.DescribeIncident(incident, useColor)
         rows[1] = "(none)"
     end
 
-    -- Nothing stored is hidden: unknown or wrongly typed fields, top-level or
-    -- inside a known block, are listed here (and exported).
+    -- Everything stored that the rows above cannot show (unknown keys, wrong
+    -- types, legacy data) is listed here and exported, so nothing is hidden.
     local other = {}
-    local otherKeys = {}
-    for key, value in pairs(incident) do
-        if KNOWN_INCIDENT_FIELDS[key] ~= type(value) then
-            otherKeys[#otherKeys + 1] = key
+    for _, key in ipairs(SortedKeys(incident)) do
+        if KNOWN_INCIDENT_FIELDS[key] ~= type(incident[key]) then
+            FlattenValue(other, tostring(key), incident[key], 1)
         end
-    end
-    sort(otherKeys, function(a, b) return tostring(a) < tostring(b) end)
-    for _, key in ipairs(otherKeys) do
-        FlattenValue(other, tostring(key), incident[key], 1)
     end
     for _, section in ipairs(SECTION_ORDER) do
-        local block = incident[section]
-        if type(block) == "table" then
-            local spec, keys = SECTION_FIELDS[section], {}
-            for key, value in pairs(block) do
-                if not (spec[key] and MatchesType(spec[key], value)) then
-                    keys[#keys + 1] = key
-                end
-            end
-            sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-            for _, key in ipairs(keys) do
-                FlattenValue(other, section .. "." .. tostring(key), block[key], 2)
-            end
+        if type(incident[section]) == "table" then
+            AppendLeftovers(other, section, incident[section], SECTION_FIELDS[section], 2)
         end
     end
+    AppendListLeftovers(other, "metadata.addOns", addOnList, function(value) return Scalar(value) ~= nil end, nil, 3)
+    if type(lastEvent) == "table" then
+        AppendLeftovers(other, "lastEvent", lastEvent, EVENT_FIELDS, 2)
+    end
+    AppendListLeftovers(other, "recentEvents", recentEvents, function() return true end, EVENT_FIELDS, 2)
     if #other > 0 then
         rows = Section("Other fields")
         for index, row in ipairs(other) do
