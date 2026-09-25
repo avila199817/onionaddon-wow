@@ -83,7 +83,7 @@ end
 Scenario("fresh install", function()
     local ns = Mock.Boot(ROOT)
     local db = _G.OnionDebugDB
-    Check(type(db) == "table" and db.schemaVersion == 2, "database created with schema 2")
+    Check(type(db) == "table" and db.schemaVersion == 3, "database created with schema 3")
     Check(db.nextIncidentId == 1 and #db.incidents == 0, "empty incident store starting at #0001")
     Check(db.settings.hudVisible == true and db.settings.printEventsToChat == false
         and db.settings.captureEvents == true and db.settings.maxEvents == 200, "default settings")
@@ -207,7 +207,7 @@ Scenario("legacy schema 1 database migrates without data loss", function()
     }
     local ns = Mock.Boot(ROOT, { db = legacy })
     local db = _G.OnionDebugDB
-    Check(db.schemaVersion == 2, "schema bumped to 2")
+    Check(db.schemaVersion == 3, "schema migrated 1 -> 3")
     Check(db.position == nil and db.ui.hud and db.ui.hud.x == 10, "position moved to ui.hud")
     Check(#db.incidents == 4, "all four table incidents kept")
     local ids = {}
@@ -707,7 +707,7 @@ Scenario("slash command parsing and errors", function()
     Check(Contains(Run("help"), "/od export <id|last|all>"), "help lists commands")
     Check(Contains(Run("status"), "Incidents: 2 stored, next ID #0003"), "status")
     Check(Contains(Run("config"), "maxEvents = 200"), "config")
-    Check(Contains(Run("version"), "OnionDebug 2.0.0"), "version")
+    Check(Contains(Run("version"), "OnionDebug 2.1.0"), "version")
     Check(Contains(Run("history minimap"), ""), "history with search")
 end)
 
@@ -736,6 +736,239 @@ Scenario("event echo to chat is opt-in", function()
     Mock.FireEvent("PLAYER_ALIVE")
     Check(#Mock.state.chat == before + 1, "one chat line per new entry (coalesced repeats are silent)")
     Check(ns.GetEvent(1).count == 2, "repeat coalesced")
+end)
+
+
+------------------------------------------------------------------------
+-- Report tracking (schema 3)
+------------------------------------------------------------------------
+
+-- Everything except the mutable report metadata: the frozen snapshot plus
+-- the human fields written at save time.
+local function SnapshotOf(incident)
+    local copy = {}
+    for key, value in pairs(incident) do
+        if key ~= "report" then
+            copy[key] = value
+        end
+    end
+    return Serialize(copy)
+end
+
+Scenario("report metadata: default, mark, unmark, persistence, snapshot untouched", function()
+    local ns = Mock.Boot(ROOT)
+    Mock.state.target = NPC_TARGET
+    local incident = ns.QuickMark("Minimap disappears")
+    Check(incident.report and incident.report.status == "local" and incident.report.provider == "blizzard"
+        and incident.report.reportedAt == nil, "new incident starts local")
+    local snapshot, createdAt = SnapshotOf(incident), incident.createdAt
+
+    Mock.Advance(100)
+    local ok = ns.MarkReported(1)
+    local markedAt = Mock.state.now
+    Check(ok and incident.report.status == "reported" and incident.report.method == "manual", "marked reported")
+    Check(incident.report.reportedAt == markedAt and incident.createdAt == createdAt, "reportedAt stamped, capture time kept")
+    Check(#incident.report.history == 1, "history entry added")
+    Check(SnapshotOf(incident) == snapshot, "snapshot unchanged by marking")
+    local again, err = ns.MarkReported(1)
+    Check(not again and Contains(err, "already"), "double mark refused")
+
+    ns = Mock.Reload(ROOT)
+    incident = ns.FindIncident(1)
+    Check(incident and incident.report.status == "reported" and incident.report.reportedAt == markedAt, "reported state survives reload")
+    Check(SnapshotOf(incident) == snapshot, "snapshot unchanged across reload")
+    local text = ns.FormatIncidentText(incident)
+    Check(Contains(text, "Report status: Reported to Blizzard") and Contains(text, "Reported at: " .. os.date("%Y-%m-%d %H:%M:%S", markedAt))
+        and Contains(text, "Report method: marked manually") and Contains(text, "Incident: #0001 (ref OD-0001-"), "full export shows report state")
+
+    Mock.Advance(50)
+    ok = ns.MarkNotReported(1)
+    Check(ok and incident.report.status == "local" and incident.report.reportedAt == nil and incident.report.method == nil, "unmarked")
+    Check(#incident.report.history == 2 and incident.report.history[1].at == markedAt, "earlier mark kept in history")
+    Check(SnapshotOf(incident) == snapshot, "snapshot unchanged by unmarking")
+    text = ns.FormatIncidentText(incident)
+    Check(Contains(text, "Report status: Local only") and Contains(text, "Report history:")
+        and Contains(text, "marked reported (manual)") and Contains(text, "marked not reported"), "history exported")
+    ns = Mock.Reload(ROOT)
+    Check(ns.FindIncident(1).report.status == "local" and ns.FindIncident(1).id == 1, "unmark survives reload, ID unchanged")
+end)
+
+Scenario("report state in HISTORY, DETAIL, HUD and slash commands", function()
+    local ns = Mock.Boot(ROOT)
+    ns.QuickMark("first")
+    ns.QuickMark("second")
+    local function Run(text)
+        local before = #Mock.state.chat
+        Mock.Slash(text)
+        return Mock.ChatSince(before)
+    end
+    Check(Contains(Run("reported 1"), "marked as reported"), "/od reported")
+    Check(Contains(Run("reported 1"), "already marked as reported"), "/od reported twice")
+    Check(Contains(Run("reported 99"), "Incident #0099 not found."), "/od reported unknown id")
+    Check(Contains(Run("unreported x"), "Invalid incident ID"), "/od unreported invalid id")
+    Mock.Slash("history")
+    local rows = _G.OnionDebugHistory.rows
+    Check(rows[1].incidentId == 2 and Contains(rows[1].statusText:GetText(), "LOCAL")
+        and Contains(rows[2].statusText:GetText(), "REPORTED"), "history shows text tags, newest first")
+    _G.OnionDebugHistory.searchBox:SetText("reported")
+    Check(rows[1].incidentId == 1 and not rows[2]:IsShown(), "search by report status")
+    _G.OnionDebugHistory.searchBox:SetText("")
+
+    ns.UI.ShowDetail(2)
+    local detail = _G.OnionDebugDetail
+    Check(detail.markButton:GetText() == "MARK AS REPORTED", "detail offers MARK AS REPORTED")
+    detail.markButton:Click()
+    Check(ns.FindIncident(2).report.status == "reported" and detail.markButton:GetText() == "MARK NOT REPORTED", "detail toggles")
+    Check(rows[1].statusText:GetText():find("REPORTED", 1, true) ~= nil, "history refreshed after mark")
+    detail.markButton:Click()
+    Check(ns.FindIncident(2).report.status == "local", "detail toggles back")
+    Check(Contains(FindHUD().values.incidents:GetText(), "1 unreported"), "HUD shows unreported count")
+    Check(Contains(Run("unreported 1"), "marked as not reported"), "/od unreported")
+    Check(Contains(Run("help"), "/od report <id|last>") and Contains(Run("status"), "Blizzard Issue Reporter: available"), "help and status")
+end)
+
+Scenario("Blizzard report text: compact, prioritized, private", function()
+    local ns = Mock.Boot(ROOT)
+    Mock.state.target = NPC_TARGET
+    Mock.FireEvent("UI_ERROR_MESSAGE", 51, "Not enough rage, again")
+    Mock.FireEvent("QUEST_LOG_UPDATE")
+    local incident = ns.SaveIncident(ns.CaptureSnapshot(), "Nameplate overlaps, level text", "Target a guard, then zoom.")
+    local text, letters = ns.FormatBlizzardReport(incident)
+    Check(letters <= 255 and ns.LetterCount(text) == letters, "fits the 255-letter Issue Reporter box (" .. letters .. ")")
+    Check(text:find("^%[OD%-0001%-%d+%] Nameplate overlaps; level text") ~= nil, "reference and title first (default severity omitted)")
+    Check(not text:find(",", 1, true), "no commas (the reporter replaces them)")
+    Check(Contains(text, "Target a guard; then zoom.") and Contains(text, "1.60.1.70009") and Contains(text, "Stormwind City / Trade District")
+        and Contains(text, "62.14 73.82") and Contains(text, "Guard Thomas (NPC 1423)") and Contains(text, "UI_ERROR_MESSAGE"),
+        "title, notes, build, location, target and useful event")
+    Check(not Contains(text, "QUEST_LOG_UPDATE") and not Contains(text, "Onion") and not Contains(text, "Creature-0")
+        and not Contains(text, "BugSack") and not Contains(text, "Session"), "no noise or personal data")
+
+    local high = ns.SaveIncident(ns.CaptureSnapshot(), "Crash", nil, "Critical")
+    Check(ns.FormatBlizzardReport(high):find("^%[OD%-%d+%-%d+%]%[Critical%] Crash") ~= nil, "non-default severity included")
+    local long = ns.SaveIncident(ns.CaptureSnapshot(), string.rep("T", 200), string.rep("\195\177", 600))
+    text, letters = ns.FormatBlizzardReport(long)
+    Check(letters <= 255 and text:find("^%[OD%-0003%-") ~= nil, "long title/notes still fit, reference kept")
+    Check(Contains(text, string.rep("\195\177", 80)), "notes keep at least 80 letters")
+
+    Mock.state.target = PLAYER_TARGET
+    local withPlayer = ns.SaveIncident(ns.CaptureSnapshot(), "Player overlap", nil)
+    text = ns.FormatBlizzardReport(withPlayer)
+    Check(Contains(text, "Target: a player") and not Contains(text, "Otherguy"), "other players' names stay local")
+    Check(pcall(ns.FormatBlizzardReport, { id = 9, title = "legacy" }), "works for sparse legacy incidents")
+end)
+
+Scenario("submission detection through C_UserFeedback.SubmitBug", function()
+    local ns = Mock.Boot(ROOT)
+    local first = ns.QuickMark("first bug")
+    local second = ns.QuickMark("second bug")
+    Check(ns.BlizzardReporter.IsAvailable() and ns.BlizzardReporter.CanDetectSubmission(), "reporter found, hook installed")
+
+    ns.UI.ShowReport(1)
+    local export = _G.OnionDebugExport
+    local text = export.area.edit:GetText()
+    Check(Contains(export.hint:GetText(), "detected automatically") and export.actionButton:GetText() == "MARK AS REPORTED",
+        "report window explains detection and offers manual mark")
+    Check(first.report.status == "local", "opening the report window does not mark anything")
+
+    local chat = #Mock.state.chat
+    local result = Mock.SubmitIssueReport("I found this: " .. text)
+    Check(result == true and #Mock.state.submittedBugs == 1, "Blizzard submit call unaffected by the hook")
+    Check(first.report.status == "reported" and first.report.method == "detected", "matching incident marked as detected")
+    Check(second.report.status == "local", "other incidents untouched")
+    Check(Contains(Mock.ChatSince(chat), "marked as reported"), "user informed")
+    Check(Contains(export.hint:GetText(), "REPORTED") and export.actionButton:GetText() == "MARK NOT REPORTED", "open report window refreshed")
+    Check(Contains(ns.FormatIncidentText(first), "Report method: detected"), "detection recorded in export")
+
+    Mock.SubmitIssueReport("unrelated bug text OD-0002-123")
+    Check(second.report.status == "local", "wrong reference (createdAt) is ignored")
+    Mock.SubmitIssueReport("Only the title: second bug")
+    Check(second.report.status == "local", "no reference, no mark")
+
+    local findIncident = ns.FindIncident
+    ns.FindIncident = function() error("boom in detection") end
+    local errors = #Mock.state.displayedErrors
+    result = Mock.SubmitIssueReport(ns.FormatBlizzardReport(second))
+    ns.FindIncident = findIncident
+    Check(result == true and #Mock.state.displayedErrors == errors + 1, "a detection error is reported, never breaks the submit")
+
+    ns.UI.ShowExport("plain", "EXPORT")
+    Check(not export.actionButton:IsShown() and export.reportId == nil and Contains(export.hint:GetText(), "Ctrl+C"),
+        "plain export has no report chrome")
+end)
+
+Scenario("no Issue Reporter / no feedback API: explicit fallback", function()
+    local ns = Mock.Boot(ROOT, { noIssueReporter = true, noFeedbackApi = true, noHooksecurefunc = true })
+    ns.QuickMark("offline bug")
+    Check(not ns.BlizzardReporter.IsAvailable() and not ns.BlizzardReporter.CanDetectSubmission(), "nothing detected")
+    ns.UI.ShowReport(1)
+    local export = _G.OnionDebugExport
+    Check(Contains(export.hint:GetText(), "Issue Reporter not found") and export.actionButton:IsShown(), "fallback instructions")
+    Check(export.area.edit:GetText():find("^%[OD%-0001%-") ~= nil, "report text still prepared")
+    export.actionButton:Click()
+    Check(ns.FindIncident(1).report.status == "reported" and ns.FindIncident(1).report.method == "manual", "manual mark works")
+    local chat = #Mock.state.chat
+    Mock.Slash("status")
+    Check(Contains(Mock.ChatSince(chat), "not found; submission detection unavailable"), "status explains")
+
+    ns = Mock.Boot(ROOT, { noIssueReporter = true }) -- API present, reporter addon missing
+    Check(not ns.BlizzardReporter.IsAvailable() and ns.BlizzardReporter.CanDetectSubmission(), "detection independent of the addon")
+end)
+
+Scenario("schema 2 -> 3 migration keeps ids, data and unknown fields", function()
+    local v2 = {
+        schemaVersion = 2, nextIncidentId = 9, ui = { hud = { point = "TOPLEFT", relativePoint = "BOTTOMLEFT", x = 5, y = 600 } },
+        settings = { maxEvents = 300 }, customTopLevel = "keep me",
+        incidents = {
+            { id = 3, title = "old", createdAt = 1780000000, createdAtText = "2026-05-28 20:26:40", severity = "High",
+                location = { zone = "Elwynn" }, futureKey = { nested = true } },
+            { id = 7, title = "scalar report", createdAt = 1780000100, report = "sent-to-gm" },
+            { id = 8, title = "odd status", createdAt = 1780000200, report = { status = "queued", note = "x" } },
+        },
+    }
+    local ns = Mock.Boot(ROOT, { db = v2 })
+    local db = _G.OnionDebugDB
+    Check(db.schemaVersion == 3 and db.nextIncidentId == 9 and db.customTopLevel == "keep me" and db.settings.maxEvents == 300,
+        "schema 3, counters and unknown top-level data kept")
+    local ids = {}
+    for index, incident in ipairs(db.incidents) do
+        ids[index] = incident.id
+    end
+    Check(table.concat(ids, ",") == "3,7,8", "ids unchanged")
+    Check(ns.FindIncident(3).report.status == "local" and ns.FindIncident(3).futureKey.nested == true, "default report, unknown fields kept")
+    Check(ns.FindIncident(7).legacyReport == "sent-to-gm" and ns.FindIncident(7).report.status == "local", "scalar report preserved")
+    local odd = ns.FindIncident(8)
+    Check(odd.report.legacyStatus == "queued" and odd.report.note == "x" and odd.report.status == "local", "unknown status preserved")
+    local text = ns.FormatIncidentText(odd)
+    Check(Contains(text, "Previous report status: queued") and Contains(text, "report.note: x"), "preserved values exported")
+    Check(Contains(ns.FormatIncidentText(ns.FindIncident(7)), "legacyReport: sent-to-gm"), "legacy report exported")
+    local once = Serialize(db)
+    Mock.Reload(ROOT)
+    Mock.Reload(ROOT)
+    local again = Serialize(_G.OnionDebugDB)
+    Check(once:gsub("session=%b{}", "") == again:gsub("session=%b{}", ""), "migration idempotent across reloads")
+end)
+
+Scenario("report history is bounded and legacy history preserved", function()
+    local ns = Mock.Boot(ROOT, { db = { schemaVersion = 2, nextIncidentId = 2,
+        incidents = { { id = 1, title = "t", createdAt = 1780000000, report = { status = "local", history = "sent twice" } } } } })
+    local incident = ns.FindIncident(1)
+    Check(incident.report.legacyHistory == "sent twice" and incident.report.history == nil, "non-table history preserved")
+    for _ = 1, 30 do
+        ns.MarkReported(1)
+        ns.MarkNotReported(1)
+    end
+    Check(#incident.report.history == 20 and incident.report.legacyHistory == "sent twice", "history capped at 20 entries")
+    Check(Contains(ns.FormatIncidentText(incident), "report.legacyHistory: sent twice"), "legacy history exported")
+end)
+
+Scenario("future schema stays read-only for report tracking", function()
+    local future = { schemaVersion = 4, nextIncidentId = 2, incidents = { { id = 1, title = "t", report = { status = "reported" } } } }
+    local before = Serialize(future)
+    local ns = Mock.Boot(ROOT, { db = future })
+    local ok, err = ns.MarkReported(1)
+    Check(not ok, "cannot mark in read-only mode")
+    Mock.SubmitIssueReport("[OD-0001-0] t")
+    Check(Serialize(_G.OnionDebugDB) == before, "saved data untouched")
 end)
 
 print(("%d checks passed, %d failed"):format(passed, failed))
