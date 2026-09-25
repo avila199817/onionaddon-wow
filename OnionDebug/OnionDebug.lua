@@ -1401,12 +1401,17 @@ function ns.DescribeIncident(incident, useColor)
         end
     end
     if target.exists or hasTargetData then
+        if target.exists == false then
+            Row(rows, "Exists", false) -- legacy data: target fields stored without a target
+        end
         Row(rows, "Name", target.name)
         Row(rows, "Level", ns.FormatLevel(target.level))
         Row(rows, "Classification", target.classification)
         local kind = target.guidType
-        if target.isPlayer then
+        if target.isPlayer == true then
             kind = (kind and kind ~= "Player") and ("Player / " .. kind) or "Player"
+        elseif target.isPlayer == false and not kind then
+            kind = "Not a player" -- GUID restricted (secret): the only hint left
         end
         Row(rows, "Kind", kind)
         Row(rows, "Reaction", ns.FormatReaction(target.reaction))

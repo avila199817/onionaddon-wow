@@ -492,8 +492,11 @@ Scenario("targets: player, NPC, none, secret", function()
     snapshot = ns.CaptureSnapshot()
     Check(snapshot.target.guid == nil and snapshot.target.name == nil, "secret values dropped")
     Check(snapshot.metadata.restrictedValues == 3, "restricted values counted")
+    Check(Contains(ns.FormatIncidentText(snapshot), "Kind: Not a player"), "isPlayer=false still shown when the GUID is secret")
     Mock.FireEvent("PLAYER_TARGET_CHANGED")
     Check(ns.GetEvent(1).event == "PLAYER_TARGET_CHANGED", "secret target does not break event recording")
+    Check(Contains(ns.FormatIncidentText({ target = { exists = false, name = "Ghost" } }), "Exists: No"),
+        "legacy exists=false shown next to stored target data")
     Mock.Tick(0.5)
 end)
 
